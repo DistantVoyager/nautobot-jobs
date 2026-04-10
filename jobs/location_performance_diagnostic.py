@@ -59,7 +59,7 @@ class LocationPerformanceDiagnostic(Job):
     class Meta:
         has_sensitive_variables = False
 
-    def run(self):
+    def run(self, custom_filter_params="", concurrent_queries=5):
         self.section_table_sizes()
         self.section_tree_structure()
         self.section_query_benchmarks()
