@@ -14,7 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from django.db import connection
-from django.db.models import Count, Q
+
 from django.http import QueryDict
 from django.test.utils import CaptureQueriesContext
 
@@ -60,6 +60,8 @@ class LocationPerformanceDiagnostic(Job):
         has_sensitive_variables = False
 
     def run(self, custom_filter_params="", concurrent_queries=5):
+        self._custom_filter_params = custom_filter_params
+        self._concurrent_queries = concurrent_queries
         self.section_table_sizes()
         self.section_tree_structure()
         self.section_query_benchmarks()
@@ -226,9 +228,27 @@ class LocationPerformanceDiagnostic(Job):
         self.logger.info("")
         self.logger.info("B) Subtree lookup for the largest root location:")
 
-        largest_root = Location.objects.filter(parent__isnull=True).annotate(
-            child_count=Count("children")
-        ).order_by("-child_count").first()
+        # Find root with the most total descendants (not just direct children)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                WITH RECURSIVE tree AS (
+                    SELECT id, id AS root_id
+                    FROM dcim_location WHERE parent_id IS NULL
+                    UNION ALL
+                    SELECT loc.id, tree.root_id
+                    FROM dcim_location loc
+                    JOIN tree ON loc.parent_id = tree.id
+                )
+                SELECT root_id, count(*) AS cnt
+                FROM tree
+                GROUP BY root_id
+                ORDER BY cnt DESC
+                LIMIT 1
+                """
+            )
+            row = cursor.fetchone()
+        largest_root = Location.objects.get(pk=row[0]) if row else None
 
         if largest_root:
             with connection.cursor() as cursor:
@@ -343,16 +363,26 @@ class LocationPerformanceDiagnostic(Job):
     # 4. FilterSet benchmarks
     # ------------------------------------------------------------------
     def section_filterset_benchmarks(self):
-        """Benchmark actual FilterSet queries that views execute."""
+        """Benchmark actual FilterSet queries with pagination simulation and EXPLAIN."""
         self.logger.info("")
         self.logger.info("=" * 60)
-        self.logger.info("4. FILTERSET BENCHMARKS (VIEW-LEVEL QUERIES)")
+        self.logger.info("4. FILTERSET BENCHMARKS (PAGINATION SIMULATION)")
         self.logger.info("=" * 60)
         self.logger.info("")
         self.logger.info(
-            "These simulate the ORM queries that Nautobot views execute, including "
-            "all FilterSet logic, annotations, and joins. Actual page loads add "
-            "object instantiation and template rendering overhead on top of these."
+            "Every Nautobot list page runs TWO queries per page load:"
+        )
+        self.logger.info(
+            "  1) COUNT(*) over the full filtered queryset (for the paginator)"
+        )
+        self.logger.info(
+            "  2) SELECT with LIMIT/OFFSET (for the current page of results)"
+        )
+        self.logger.info(
+            "Both go through the FilterSet, so tree filters (parent=, location=)"
+        )
+        self.logger.info(
+            "trigger recursive CTEs on EVERY page load, EVERY page navigation."
         )
 
         # Build default test cases: (label, filterset_class, query_string)
@@ -370,12 +400,26 @@ class LocationPerformanceDiagnostic(Job):
             )
 
         # Parent filter (TreeNodeMultipleChoiceFilter) with the largest root
-        largest_root = (
-            Location.objects.filter(parent__isnull=True)
-            .annotate(child_count=Count("children"))
-            .order_by("-child_count")
-            .first()
-        )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                WITH RECURSIVE tree AS (
+                    SELECT id, id AS root_id
+                    FROM dcim_location WHERE parent_id IS NULL
+                    UNION ALL
+                    SELECT loc.id, tree.root_id
+                    FROM dcim_location loc
+                    JOIN tree ON loc.parent_id = tree.id
+                )
+                SELECT root_id, count(*) AS cnt
+                FROM tree
+                GROUP BY root_id
+                ORDER BY cnt DESC
+                LIMIT 1
+                """
+            )
+            row = cursor.fetchone()
+        largest_root = Location.objects.get(pk=row[0]) if row else None
         if largest_root:
             test_cases.append((
                 f"Location parent={largest_root.name}",
@@ -389,7 +433,7 @@ class LocationPerformanceDiagnostic(Job):
             ))
 
         # Custom filter params from user input
-        custom_params = self.kwargs.get("custom_filter_params", "")
+        custom_params = self._custom_filter_params
         if custom_params:
             for line in custom_params.strip().splitlines():
                 line = line.strip()
@@ -415,32 +459,68 @@ class LocationPerformanceDiagnostic(Job):
             base_qs = Location.objects.all() if fs_class is LocationFilterSet else Device.objects.all()
             qd = QueryDict(query_str)
             try:
-                with CaptureQueriesContext(connection) as ctx:
-                    start = time.perf_counter()
-                    filterset = fs_class(data=qd, queryset=base_qs)
-                    count = filterset.qs.count()
-                    elapsed = time.perf_counter() - start
+                filterset = fs_class(data=qd, queryset=base_qs)
+                qs = filterset.qs
 
+                # Phase 1: COUNT(*) — the paginator query
+                with CaptureQueriesContext(connection) as count_ctx:
+                    start = time.perf_counter()
+                    total = qs.count()
+                    count_elapsed = time.perf_counter() - start
+
+                # Phase 2: Page slice — first page of results (LIMIT 50)
+                with CaptureQueriesContext(connection) as page_ctx:
+                    start = time.perf_counter()
+                    list(qs[:50])
+                    page_elapsed = time.perf_counter() - start
+
+                combined = count_elapsed + page_elapsed
+
+                self.logger.info("  --- %s ---", label)
                 self.logger.info(
-                    "  %-50s  results=%-8s  queries=%-3d  time=%.2fs",
-                    label, f"{count:,}", len(ctx), elapsed,
+                    "    Results: %-8s  Count: %.3fs (%d queries)  Page: %.3fs (%d queries)  Total: %.3fs",
+                    f"{total:,}", count_elapsed, len(count_ctx),
+                    page_elapsed, len(page_ctx), combined,
                 )
 
-                if ctx.captured_queries and len(ctx.captured_queries) > 1:
-                    slowest = max(ctx.captured_queries, key=lambda q: float(q.get("time", 0)))
-                    slowest_time = float(slowest.get("time", 0))
-                    slowest_sql = slowest.get("sql", "")[:120]
-                    self.logger.info(
-                        "    Slowest query (%.3fs): %s...", slowest_time, slowest_sql
-                    )
-
-                if elapsed > 5:
+                if combined > 5:
                     self.logger.warning("    ** SLOW ** — likely causes 502 under load!")
-                elif elapsed > 2:
+                elif combined > 2:
                     self.logger.warning("    Borderline — may timeout with concurrent users.")
 
+                # Phase 3: EXPLAIN ANALYZE on the count query (usually the bottleneck)
+                if count_ctx.captured_queries:
+                    count_sql = count_ctx.captured_queries[-1]["sql"]
+                    self.logger.info("    Count SQL: %s", count_sql[:200])
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) %s" % count_sql  # noqa: S608
+                        )
+                        plan_lines = [row[0] for row in cursor.fetchall()]
+
+                    self.logger.info("    EXPLAIN ANALYZE (count query):")
+                    for plan_line in plan_lines:
+                        self.logger.info("      %s", plan_line)
+
+                    # Flag specific bottleneck patterns
+                    plan_text = "\n".join(plan_lines)
+                    if "Seq Scan" in plan_text:
+                        self.logger.warning(
+                            "    ** Sequential scan detected — consider adding an index"
+                        )
+                    if "Sort Method: external" in plan_text:
+                        self.logger.warning(
+                            "    ** Sort spilled to disk — work_mem is too low for this query"
+                        )
+                    if "Rows Removed by Filter" in plan_text:
+                        for plan_line in plan_lines:
+                            if "Rows Removed by Filter" in plan_line:
+                                self.logger.info("    ^ %s", plan_line.strip())
+
+                self.logger.info("")
+
             except Exception as e:
-                self.logger.error("  %-50s  ERROR: %s", label, str(e))
+                self.logger.error("  %s  ERROR: %s", label, str(e))
 
     # ------------------------------------------------------------------
     # 5. Concurrent load simulation
@@ -452,7 +532,7 @@ class LocationPerformanceDiagnostic(Job):
         self.logger.info("5. CONCURRENT LOAD SIMULATION")
         self.logger.info("=" * 60)
 
-        num_queries = min(max(int(self.kwargs.get("concurrent_queries", 5)), 1), 20)
+        num_queries = min(max(int(self._concurrent_queries), 1), 20)
 
         self.logger.info("")
         self.logger.info(
