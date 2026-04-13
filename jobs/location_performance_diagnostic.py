@@ -62,34 +62,74 @@ class LocationPerformanceDiagnostic(Job):
     def run(self, custom_filter_params="", concurrent_queries=5):
         self._custom_filter_params = custom_filter_params
         self._concurrent_queries = concurrent_queries
-        self.section_table_sizes()
-        self.section_tree_structure()
-        self.section_query_benchmarks()
-        self.section_filterset_benchmarks()
-        self.section_concurrent_load()
-        self.section_index_check()
-        self.section_connection_diagnostics()
-        self.section_pg_settings()
-        self.section_recommendations()
+        self._lines = []
+        self._real_logger = self.logger
+
+        sections = [
+            ("Table sizes", self.section_table_sizes),
+            ("Tree structure", self.section_tree_structure),
+            ("Raw query benchmarks", self.section_query_benchmarks),
+            ("FilterSet benchmarks", self.section_filterset_benchmarks),
+            ("Concurrent load simulation", self.section_concurrent_load),
+            ("Index check", self.section_index_check),
+            ("Connection diagnostics", self.section_connection_diagnostics),
+            ("PostgreSQL settings", self.section_pg_settings),
+            ("Recommendations", self.section_recommendations),
+        ]
+        for label, section in sections:
+            self._real_logger.info("Running: %s", label)
+            section()
+
+        # Write full report to downloadable file
+        content = "\n".join(self._lines)
+        filename = "location_performance_report.txt"
+        try:
+            self.create_file(filename, content)
+            self._real_logger.info(
+                "Full report written to downloadable file: %s (%d lines)",
+                filename, len(self._lines),
+            )
+        except Exception as exc:
+            self._real_logger.warning(
+                "Could not create file (%s) — dumping report to log instead.", exc
+            )
+            for line in self._lines:
+                self._real_logger.info(line)
+
+    # ------------------------------------------------------------------
+    # Output helpers — write to buffer; only warnings/errors also go to log
+    # ------------------------------------------------------------------
+    def _info(self, message, *args):
+        self._lines.append(message % args if args else message)
+
+    def _warning(self, message, *args):
+        formatted = message % args if args else message
+        self._lines.append("[WARNING] " + formatted)
+        self._real_logger.warning(message, *args)
+
+    def _error(self, message, *args):
+        formatted = message % args if args else message
+        self._lines.append("[ERROR] " + formatted)
+        self._real_logger.error(message, *args)
 
     # ------------------------------------------------------------------
     # 1. Table sizes
     # ------------------------------------------------------------------
     def section_table_sizes(self):
-        self.logger.info("=" * 60)
-        self.logger.info("1. TABLE SIZES")
-        self.logger.info("=" * 60)
+        self._info("=" * 60)
+        self._info("1. TABLE SIZES")
+        self._info("=" * 60)
 
         location_count = Location.objects.count()
         device_count = Device.objects.count()
         rack_count = Rack.objects.count()
 
-        self.logger.info("Locations:  %s", f"{location_count:,}")
-        self.logger.info("Devices:    %s", f"{device_count:,}")
-        self.logger.info("Racks:      %s", f"{rack_count:,}")
+        self._info("Locations:  %s", f"{location_count:,}")
+        self._info("Devices:    %s", f"{device_count:,}")
+        self._info("Racks:      %s", f"{rack_count:,}")
 
         if location_count > 100_000:
-            self.logger.warning(
+            self._warning(
                 "Location count (%s) is very high. "
                 "Tree queries (recursive CTEs) will be expensive.",
                 f"{location_count:,}",
@@ -106,7 +146,7 @@ class LocationPerformanceDiagnostic(Job):
                 """
             )
             row = cursor.fetchone()
-            self.logger.info(
+            self._info(
                 "dcim_location disk usage — total: %s, data: %s, indexes: %s",
                 row[0], row[1], row[2],
             )
@@ -115,13 +155,13 @@ class LocationPerformanceDiagnostic(Job):
     # 2. Tree structure
     # ------------------------------------------------------------------
     def section_tree_structure(self):
-        self.logger.info("")
-        self.logger.info("=" * 60)
-        self.logger.info("2. LOCATION TREE STRUCTURE")
-        self.logger.info("=" * 60)
+        self._info("")
+        self._info("=" * 60)
+        self._info("2. LOCATION TREE STRUCTURE")
+        self._info("=" * 60)
 
         root_count = Location.objects.filter(parent__isnull=True).count()
-        self.logger.info("Root locations (no parent): %s", f"{root_count:,}")
+        self._info("Root locations (no parent): %s", f"{root_count:,}")
 
         # Depth distribution via raw SQL (ORM can't do this efficiently)
         with connection.cursor() as cursor:
@@ -143,20 +183,20 @@ class LocationPerformanceDiagnostic(Job):
             )
             rows = cursor.fetchall()
 
-        self.logger.info("Tree depth distribution:")
+        self._info("Tree depth distribution:")
         for depth, cnt in rows:
             bar = "#" * min(cnt // max(1, sum(r[1] for r in rows) // 40), 40)
-            self.logger.info("  Depth %d: %s locations %s", depth, f"{cnt:>12,}", bar)
+            self._info("  Depth %d: %s locations %s", depth, f"{cnt:>12,}", bar)
 
         max_depth = rows[-1][0] if rows else 0
         if max_depth > 10:
-            self.logger.warning(
+            self._warning(
                 "Tree depth of %d is deep. Each level adds cost to recursive CTEs.", max_depth
             )
 
         # Largest subtrees
-        self.logger.info("")
-        self.logger.info("Top 10 largest root subtrees:")
+        self._info("")
+        self._info("Top 10 largest root subtrees:")
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -178,7 +218,7 @@ class LocationPerformanceDiagnostic(Job):
                 """
             )
             for name, desc_count, loc_type in cursor.fetchall():
-                self.logger.info(
+                self._info(
                     "  %-40s  type=%-15s  descendants=%s",
                     name, loc_type, f"{desc_count:,}",
                 )
@@ -187,14 +227,14 @@ class LocationPerformanceDiagnostic(Job):
     # 3. Query benchmarks
     # ------------------------------------------------------------------
     def section_query_benchmarks(self):
-        self.logger.info("")
-        self.logger.info("=" * 60)
-        self.logger.info("3. QUERY BENCHMARKS")
-        self.logger.info("=" * 60)
+        self._info("")
+        self._info("=" * 60)
+        self._info("3. QUERY BENCHMARKS")
+        self._info("=" * 60)
 
         # --- Benchmark A: Full tree CTE ---
-        self.logger.info("")
-        self.logger.info("A) Full tree recursive CTE (what TreeNodeMultipleChoiceFilter triggers):")
+        self._info("")
+        self._info("A) Full tree recursive CTE (what TreeNodeMultipleChoiceFilter triggers):")
 
         with connection.cursor() as cursor:
             start = time.perf_counter()
@@ -214,19 +254,19 @@ class LocationPerformanceDiagnostic(Job):
             elapsed = time.perf_counter() - start
             count = cursor.fetchone()[0]
 
-        self.logger.info("  Traversed %s nodes in %.2f seconds", f"{count:,}", elapsed)
+        self._info("  Traversed %s nodes in %.2f seconds", f"{count:,}", elapsed)
         if elapsed > 5:
-            self.logger.warning(
+            self._warning(
                 "  ** SLOW ** — This CTE runs on EVERY location-filtered page load!"
             )
         elif elapsed > 1:
-            self.logger.warning("  Borderline slow — may cause intermittent timeouts under load.")
+            self._warning("  Borderline slow — may cause intermittent timeouts under load.")
         else:
-            self.logger.info("  Acceptable performance.")
+            self._info("  Acceptable performance.")
 
         # --- Benchmark B: Subtree of the largest root ---
-        self.logger.info("")
-        self.logger.info("B) Subtree lookup for the largest root location:")
+        self._info("")
+        self._info("B) Subtree lookup for the largest root location:")
 
         # Find root with the most total descendants (not just direct children)
         with connection.cursor() as cursor:
@@ -269,16 +309,16 @@ class LocationPerformanceDiagnostic(Job):
                 elapsed = time.perf_counter() - start
                 count = cursor.fetchone()[0]
 
-            self.logger.info(
+            self._info(
                 '  Root "%s" — %s descendants in %.2f seconds',
                 largest_root.name, f"{count:,}", elapsed,
             )
         else:
-            self.logger.info("  No root locations found.")
+            self._info("  No root locations found.")
 
         # --- Benchmark C: ILIKE search (what ?q= does) ---
-        self.logger.info("")
-        self.logger.info("C) ILIKE search simulation (?q= filter):")
+        self._info("")
+        self._info("C) ILIKE search simulation (?q= filter):")
 
         # Pick a realistic search term from existing data
         sample_loc = Location.objects.first()
@@ -296,7 +336,7 @@ class LocationPerformanceDiagnostic(Job):
             elapsed = time.perf_counter() - start
             count = cursor.fetchone()[0]
 
-        self.logger.info(
+        self._info(
             '  Search for "%%%s%%" — %s matches in %.2f seconds',
             search_term, f"{count:,}", elapsed,
         )
@@ -310,23 +350,23 @@ class LocationPerformanceDiagnostic(Job):
             plan = "\n".join(row[0] for row in cursor.fetchall())
 
         if "Seq Scan" in plan:
-            self.logger.warning(
+            self._warning(
                 "  ** SEQUENTIAL SCAN ** — No trigram index! "
                 "This scans every row on every search."
             )
         elif "Bitmap Index Scan" in plan or "Index Scan" in plan:
-            self.logger.info("  Using an index — good.")
-        self.logger.info("  Query plan: %s", plan.split("\n")[0].strip())
+            self._info("  Using an index — good.")
+        self._info("  Query plan: %s", plan.split("\n")[0].strip())
 
         # --- Benchmark D: Device count by location (StatsPanel) ---
-        self.logger.info("")
-        self.logger.info("D) Device count for a location (what StatsPanel computes):")
+        self._info("")
+        self._info("D) Device count for a location (what StatsPanel computes):")
 
         if largest_root:
             start = time.perf_counter()
             device_count = Device.objects.filter(location=largest_root).count()
             elapsed = time.perf_counter() - start
-            self.logger.info(
+            self._info(
                 '  Devices at "%s": %s in %.2f seconds (direct, no descendants)',
                 largest_root.name, f"{device_count:,}", elapsed,
             )
@@ -350,12 +390,12 @@ class LocationPerformanceDiagnostic(Job):
                 elapsed = time.perf_counter() - start
                 count = cursor.fetchone()[0]
 
-            self.logger.info(
+            self._info(
                 '  Devices at "%s" + all descendants: %s in %.2f seconds',
                 largest_root.name, f"{count:,}", elapsed,
             )
             if elapsed > 3:
-                self.logger.warning(
+                self._warning(
                     "  ** SLOW ** — This runs every time someone views this location's detail page!"
                 )
 
@@ -364,24 +404,24 @@ class LocationPerformanceDiagnostic(Job):
     # ------------------------------------------------------------------
     def section_filterset_benchmarks(self):
         """Benchmark actual FilterSet queries with pagination simulation and EXPLAIN."""
-        self.logger.info("")
-        self.logger.info("=" * 60)
-        self.logger.info("4. FILTERSET BENCHMARKS (PAGINATION SIMULATION)")
-        self.logger.info("=" * 60)
-        self.logger.info("")
-        self.logger.info(
+        self._info("")
+        self._info("=" * 60)
+        self._info("4. FILTERSET BENCHMARKS (PAGINATION SIMULATION)")
+        self._info("=" * 60)
+        self._info("")
+        self._info(
             "Every Nautobot list page runs TWO queries per page load:"
         )
-        self.logger.info(
+        self._info(
             "  1) COUNT(*) over the full filtered queryset (for the paginator)"
         )
-        self.logger.info(
+        self._info(
             "  2) SELECT with LIMIT/OFFSET (for the current page of results)"
         )
-        self.logger.info(
+        self._info(
             "Both go through the FilterSet, so tree filters (parent=, location=)"
         )
-        self.logger.info(
+        self._info(
             "trigger recursive CTEs on EVERY page load, EVERY page navigation."
         )
 
@@ -454,7 +494,7 @@ class LocationPerformanceDiagnostic(Job):
                 test_cases.append((label, fs_class, query_str))
 
         # Run benchmarks
-        self.logger.info("")
+        self._info("")
         for label, fs_class, query_str in test_cases:
             base_qs = Location.objects.all() if fs_class is LocationFilterSet else Device.objects.all()
             qd = QueryDict(query_str)
@@ -476,66 +516,66 @@ class LocationPerformanceDiagnostic(Job):
 
                 combined = count_elapsed + page_elapsed
 
-                self.logger.info("  --- %s ---", label)
-                self.logger.info(
+                self._info("  --- %s ---", label)
+                self._info(
                     "    Results: %-8s  Count: %.3fs (%d queries)  Page: %.3fs (%d queries)  Total: %.3fs",
                     f"{total:,}", count_elapsed, len(count_ctx),
                     page_elapsed, len(page_ctx), combined,
                 )
 
                 if combined > 5:
-                    self.logger.warning("    ** SLOW ** — likely causes 502 under load!")
+                    self._warning("    ** SLOW ** — likely causes 502 under load!")
                 elif combined > 2:
-                    self.logger.warning("    Borderline — may timeout with concurrent users.")
+                    self._warning("    Borderline — may timeout with concurrent users.")
 
                 # Phase 3: EXPLAIN ANALYZE on the count query (usually the bottleneck)
                 if count_ctx.captured_queries:
                     count_sql = count_ctx.captured_queries[-1]["sql"]
-                    self.logger.info("    Count SQL: %s", count_sql[:200])
+                    self._info("    Count SQL: %s", count_sql[:200])
                     with connection.cursor() as cursor:
                         cursor.execute(
                             "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) %s" % count_sql  # noqa: S608
                         )
                         plan_lines = [row[0] for row in cursor.fetchall()]
 
-                    self.logger.info("    EXPLAIN ANALYZE (count query):")
+                    self._info("    EXPLAIN ANALYZE (count query):")
                     for plan_line in plan_lines:
-                        self.logger.info("      %s", plan_line)
+                        self._info("      %s", plan_line)
 
                     # Flag specific bottleneck patterns
                     plan_text = "\n".join(plan_lines)
                     if "Seq Scan" in plan_text:
-                        self.logger.warning(
+                        self._warning(
                             "    ** Sequential scan detected — consider adding an index"
                         )
                     if "Sort Method: external" in plan_text:
-                        self.logger.warning(
+                        self._warning(
                             "    ** Sort spilled to disk — work_mem is too low for this query"
                         )
                     if "Rows Removed by Filter" in plan_text:
                         for plan_line in plan_lines:
                             if "Rows Removed by Filter" in plan_line:
-                                self.logger.info("    ^ %s", plan_line.strip())
+                                self._info("    ^ %s", plan_line.strip())
 
-                self.logger.info("")
+                self._info("")
 
             except Exception as e:
-                self.logger.error("  %s  ERROR: %s", label, str(e))
+                self._error("  %s  ERROR: %s", label, str(e))
 
     # ------------------------------------------------------------------
     # 5. Concurrent load simulation
     # ------------------------------------------------------------------
     def section_concurrent_load(self):
         """Simulate concurrent tree CTE queries to test degradation under load."""
-        self.logger.info("")
-        self.logger.info("=" * 60)
-        self.logger.info("5. CONCURRENT LOAD SIMULATION")
-        self.logger.info("=" * 60)
+        self._info("")
+        self._info("=" * 60)
+        self._info("5. CONCURRENT LOAD SIMULATION")
+        self._info("=" * 60)
 
         num_queries = min(max(int(self._concurrent_queries), 1), 20)
 
-        self.logger.info("")
-        self.logger.info(
+        self._info("")
+        self._info(
             "Running %d parallel tree CTE queries (each opens its own DB connection)...",
             num_queries,
         )
@@ -572,7 +612,7 @@ class LocationPerformanceDiagnostic(Job):
                 try:
                     times.append(future.result())
                 except Exception as e:
-                    self.logger.error("  Query failed: %s", str(e))
+                    self._error("  Query failed: %s", str(e))
         wall_elapsed = time.perf_counter() - wall_start
 
         if times:
@@ -580,44 +620,44 @@ class LocationPerformanceDiagnostic(Job):
             max_time = max(times)
             min_time = min(times)
 
-            self.logger.info("  Completed:    %d / %d queries", len(times), num_queries)
-            self.logger.info("  Wall clock:   %.2f seconds", wall_elapsed)
-            self.logger.info(
+            self._info("  Completed:    %d / %d queries", len(times), num_queries)
+            self._info("  Wall clock:   %.2f seconds", wall_elapsed)
+            self._info(
                 "  Per-query:    min=%.2fs  avg=%.2fs  max=%.2fs",
                 min_time, avg_time, max_time,
             )
-            self.logger.info(
+            self._info(
                 "  Throughput:   %.1f queries/sec",
                 len(times) / wall_elapsed if wall_elapsed > 0 else 0,
             )
 
             if max_time > 10:
-                self.logger.warning(
+                self._warning(
                     "  ** CRITICAL ** — Slowest query took %.1fs. "
                     "Under real traffic with %d+ concurrent users, 502s are expected.",
                     max_time, num_queries,
                 )
             elif max_time > 5:
-                self.logger.warning(
+                self._warning(
                     "  ** SLOW ** — Queries degrade under concurrency. "
                     "This explains intermittent 502s during peak traffic.",
                 )
             elif avg_time > 2:
-                self.logger.warning(
+                self._warning(
                     "  Elevated average (%.1fs) — may cause issues at higher concurrency.",
                     avg_time,
                 )
             else:
-                self.logger.info("  Performance holds under simulated concurrent load.")
+                self._info("  Performance holds under simulated concurrent load.")
 
     # ------------------------------------------------------------------
     # 6. Index check
     # ------------------------------------------------------------------
     def section_index_check(self):
-        self.logger.info("")
-        self.logger.info("=" * 60)
-        self.logger.info("6. INDEX CHECK")
-        self.logger.info("=" * 60)
+        self._info("")
+        self._info("=" * 60)
+        self._info("6. INDEX CHECK")
+        self._info("=" * 60)
 
         with connection.cursor() as cursor:
             # Trigram extension
@@ -646,43 +686,43 @@ class LocationPerformanceDiagnostic(Job):
 
         # Report
         if has_trgm:
-            self.logger.info("pg_trgm extension: INSTALLED")
+            self._info("pg_trgm extension: INSTALLED")
         else:
-            self.logger.warning("pg_trgm extension: ** MISSING **")
+            self._warning("pg_trgm extension: ** MISSING **")
 
         if location_trgm:
-            self.logger.info("Trigram index on dcim_location.name: EXISTS (%s)", location_trgm[0])
+            self._info("Trigram index on dcim_location.name: EXISTS (%s)", location_trgm[0])
         else:
-            self.logger.warning(
+            self._warning(
                 "Trigram index on dcim_location.name: ** MISSING ** — "
                 "all ?q= searches do full table scans!"
             )
 
         if device_trgm:
-            self.logger.info("Trigram index on dcim_device.name: EXISTS (%s)", device_trgm[0])
+            self._info("Trigram index on dcim_device.name: EXISTS (%s)", device_trgm[0])
         else:
-            self.logger.warning(
+            self._warning(
                 "Trigram index on dcim_device.name: ** MISSING ** — "
                 "device searches do full table scans"
             )
 
-        self.logger.info("")
-        self.logger.info("Parent ID indexes on dcim_location:")
+        self._info("")
+        self._info("Parent ID indexes on dcim_location:")
         if parent_indexes:
             for name, defn in parent_indexes:
-                self.logger.info("  %s", name)
+                self._info("  %s", name)
         else:
-            self.logger.warning("  ** NONE ** — tree CTE joins on parent_id with no index!")
+            self._warning("  ** NONE ** — tree CTE joins on parent_id with no index!")
 
     # ------------------------------------------------------------------
     # 7. Connection & query diagnostics
     # ------------------------------------------------------------------
     def section_connection_diagnostics(self):
         """Check pg_stat_activity for connection and query health."""
-        self.logger.info("")
-        self.logger.info("=" * 60)
-        self.logger.info("7. CONNECTION & QUERY DIAGNOSTICS")
-        self.logger.info("=" * 60)
+        self._info("")
+        self._info("=" * 60)
+        self._info("7. CONNECTION & QUERY DIAGNOSTICS")
+        self._info("=" * 60)
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -696,33 +736,33 @@ class LocationPerformanceDiagnostic(Job):
             )
             rows = cursor.fetchall()
 
-        self.logger.info("")
-        self.logger.info("Connection states (current database):")
+        self._info("")
+        self._info("Connection states (current database):")
         total_conns = 0
         for state, count in rows:
             state_label = state or "NULL (background worker)"
-            self.logger.info("  %-25s %d", state_label, count)
+            self._info("  %-25s %d", state_label, count)
             total_conns += count
-        self.logger.info("  %-25s %d", "TOTAL", total_conns)
+        self._info("  %-25s %d", "TOTAL", total_conns)
 
         with connection.cursor() as cursor:
             cursor.execute("SELECT setting FROM pg_settings WHERE name = 'max_connections'")
             max_conns = int(cursor.fetchone()[0])
 
         usage_pct = (total_conns / max_conns * 100) if max_conns > 0 else 0
-        self.logger.info(
+        self._info(
             "  Usage: %d / %d (%.0f%%)", total_conns, max_conns, usage_pct
         )
         if usage_pct > 80:
-            self.logger.warning(
+            self._warning(
                 "  ** HIGH ** — %.0f%% of connections in use. "
                 "New requests may queue or be rejected.",
                 usage_pct,
             )
 
         # Long-running queries
-        self.logger.info("")
-        self.logger.info("Active queries running > 5 seconds:")
+        self._info("")
+        self._info("Active queries running > 5 seconds:")
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -743,20 +783,20 @@ class LocationPerformanceDiagnostic(Job):
 
         if long_queries:
             for pid, duration, state, query_preview in long_queries:
-                self.logger.warning(
+                self._warning(
                     "  PID %s  running %s: %s...", pid, duration, query_preview
                 )
-            self.logger.warning(
+            self._warning(
                 "  Found %d long-running queries — these hold connections and "
                 "can cause 502s by exhausting the worker/connection pool.",
                 len(long_queries),
             )
         else:
-            self.logger.info("  None found (good).")
+            self._info("  None found (good).")
 
         # Blocked/waiting queries
-        self.logger.info("")
-        self.logger.info("Queries waiting on locks:")
+        self._info("")
+        self._info("Queries waiting on locks:")
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -769,18 +809,18 @@ class LocationPerformanceDiagnostic(Job):
             blocked_count = cursor.fetchone()[0]
 
         if blocked_count > 0:
-            self.logger.warning("  %d queries currently waiting on locks.", blocked_count)
+            self._warning("  %d queries currently waiting on locks.", blocked_count)
         else:
-            self.logger.info("  None found (good).")
+            self._info("  None found (good).")
 
     # ------------------------------------------------------------------
     # 8. PostgreSQL settings
     # ------------------------------------------------------------------
     def section_pg_settings(self):
-        self.logger.info("")
-        self.logger.info("=" * 60)
-        self.logger.info("8. POSTGRESQL SETTINGS")
-        self.logger.info("=" * 60)
+        self._info("")
+        self._info("=" * 60)
+        self._info("8. POSTGRESQL SETTINGS")
+        self._info("=" * 60)
 
         checks = {
             "work_mem": {
@@ -818,52 +858,52 @@ class LocationPerformanceDiagnostic(Job):
                         is_bad = value == check["warn_value"]
 
                     if is_bad:
-                        self.logger.warning("  %s = %s — %s", setting_name, display, check["message"])
+                        self._warning("  %s = %s — %s", setting_name, display, check["message"])
                     else:
-                        self.logger.info("  %s = %s", setting_name, display)
+                        self._info("  %s = %s", setting_name, display)
 
     # ------------------------------------------------------------------
     # 9. Recommendations
     # ------------------------------------------------------------------
     def section_recommendations(self):
-        self.logger.info("")
-        self.logger.info("=" * 60)
-        self.logger.info("9. RECOMMENDATIONS")
-        self.logger.info("=" * 60)
-        self.logger.info("")
-        self.logger.info("--- Missing indexes ---")
-        self.logger.info("If trigram indexes are missing, a database administrator should run:")
-        self.logger.info("  CREATE EXTENSION IF NOT EXISTS pg_trgm;")
-        self.logger.info(
+        self._info("")
+        self._info("=" * 60)
+        self._info("9. RECOMMENDATIONS")
+        self._info("=" * 60)
+        self._info("")
+        self._info("--- Missing indexes ---")
+        self._info("If trigram indexes are missing, a database administrator should run:")
+        self._info("  CREATE EXTENSION IF NOT EXISTS pg_trgm;")
+        self._info(
             "  CREATE INDEX CONCURRENTLY idx_dcim_location_name_trgm"
         )
-        self.logger.info("      ON dcim_location USING gin (name gin_trgm_ops);")
-        self.logger.info(
+        self._info("      ON dcim_location USING gin (name gin_trgm_ops);")
+        self._info(
             "  CREATE INDEX CONCURRENTLY idx_dcim_device_name_trgm"
         )
-        self.logger.info("      ON dcim_device USING gin (name gin_trgm_ops);")
-        self.logger.info("")
-        self.logger.info("--- PostgreSQL tuning ---")
-        self.logger.info("If work_mem is low:")
-        self.logger.info("  ALTER DATABASE nautobot SET work_mem = '256MB';")
-        self.logger.info("")
-        self.logger.info("If statement_timeout is unlimited:")
-        self.logger.info("  ALTER ROLE nautobot SET statement_timeout = '15s';")
-        self.logger.info("")
-        self.logger.info("--- Concurrent load / connection issues ---")
-        self.logger.info("If queries degrade under concurrent load:")
-        self.logger.info("  - Ensure connection pooling (PgBouncer) is configured")
-        self.logger.info("  - Reduce Nautobot worker count if DB CPU is saturated")
-        self.logger.info("  - Consider increasing shared_buffers (25%% of system RAM)")
-        self.logger.info("")
-        self.logger.info("If connection usage is high:")
-        self.logger.info("  - Check for connection leaks (idle connections that never close)")
-        self.logger.info("  - Lower CONN_MAX_AGE in Django settings or configure PgBouncer")
-        self.logger.info("")
-        self.logger.info("--- Nautobot Cloud ---")
-        self.logger.info("For Nautobot Cloud instances, share this job's full output with")
-        self.logger.info("the Cloud support team — they manage PostgreSQL settings and can")
-        self.logger.info("apply index and tuning changes on your behalf.")
+        self._info("      ON dcim_device USING gin (name gin_trgm_ops);")
+        self._info("")
+        self._info("--- PostgreSQL tuning ---")
+        self._info("If work_mem is low:")
+        self._info("  ALTER DATABASE nautobot SET work_mem = '256MB';")
+        self._info("")
+        self._info("If statement_timeout is unlimited:")
+        self._info("  ALTER ROLE nautobot SET statement_timeout = '15s';")
+        self._info("")
+        self._info("--- Concurrent load / connection issues ---")
+        self._info("If queries degrade under concurrent load:")
+        self._info("  - Ensure connection pooling (PgBouncer) is configured")
+        self._info("  - Reduce Nautobot worker count if DB CPU is saturated")
+        self._info("  - Consider increasing shared_buffers (25%% of system RAM)")
+        self._info("")
+        self._info("If connection usage is high:")
+        self._info("  - Check for connection leaks (idle connections that never close)")
+        self._info("  - Lower CONN_MAX_AGE in Django settings or configure PgBouncer")
+        self._info("")
+        self._info("--- Nautobot Cloud ---")
+        self._info("For Nautobot Cloud instances, share this job's full output with")
+        self._info("the Cloud support team — they manage PostgreSQL settings and can")
+        self._info("apply index and tuning changes on your behalf.")
 
 
 register_jobs(LocationPerformanceDiagnostic)
