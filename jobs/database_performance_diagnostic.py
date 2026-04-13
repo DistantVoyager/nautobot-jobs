@@ -23,7 +23,7 @@ from django.test.utils import CaptureQueriesContext
 
 from nautobot.apps.jobs import IntegerVar, Job, TextVar, register_jobs
 from nautobot.dcim.filters import DeviceFilterSet, LocationFilterSet
-from nautobot.dcim.models import Device, Location, Rack
+from nautobot.dcim.models import Device, Location
 
 
 class DatabasePerformanceDiagnostic(Job):
@@ -139,39 +139,7 @@ class DatabasePerformanceDiagnostic(Job):
         self._info("1. TABLE SIZES")
         self._info("=" * 60)
 
-        location_count = Location.objects.count()
-        device_count = Device.objects.count()
-        rack_count = Rack.objects.count()
-
-        self._info("Locations:  %s", f"{location_count:,}")
-        self._info("Devices:    %s", f"{device_count:,}")
-        self._info("Racks:      %s", f"{rack_count:,}")
-
-        if location_count > 100_000:
-            self._warning(
-                "Location count (%s) is very high. "
-                "Tree queries (recursive CTEs) will be expensive.",
-                f"{location_count:,}",
-            )
-
-        # dcim_location-specific breakdown
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT
-                    pg_size_pretty(pg_total_relation_size('dcim_location')) AS total,
-                    pg_size_pretty(pg_relation_size('dcim_location')) AS data,
-                    pg_size_pretty(pg_indexes_size('dcim_location'::regclass)) AS indexes
-                """
-            )
-            row = cursor.fetchone()
-            self._info(
-                "dcim_location disk usage — total: %s, data: %s, indexes: %s",
-                row[0], row[1], row[2],
-            )
-
         # Top 20 tables by total disk size (database-wide)
-        self._info("")
         self._info("Top 20 tables by total disk size:")
         with connection.cursor() as cursor:
             cursor.execute(
@@ -259,20 +227,26 @@ class DatabasePerformanceDiagnostic(Job):
                     FROM dcim_location loc
                     JOIN tree ON loc.parent_id = tree.id
                 )
-                SELECT root.name, count(*) AS descendants, lt.name AS location_type
+                SELECT root.id, root.name, count(*) AS descendants, lt.name AS location_type
                 FROM tree
                 JOIN dcim_location root ON tree.root_id = root.id
                 JOIN dcim_locationtype lt ON root.location_type_id = lt.id
-                GROUP BY root.name, lt.name
+                GROUP BY root.id, root.name, lt.name
                 ORDER BY count(*) DESC
                 LIMIT 10
                 """
             )
-            for name, desc_count, loc_type in cursor.fetchall():
-                self._info(
-                    "  %-40s  type=%-15s  descendants=%s",
-                    name, loc_type, f"{desc_count:,}",
-                )
+            largest_root_rows = cursor.fetchall()
+        for _root_id, name, desc_count, loc_type in largest_root_rows:
+            self._info(
+                "  %-40s  type=%-15s  descendants=%s",
+                name, loc_type, f"{desc_count:,}",
+            )
+        # Stash the top one so sections 3 and 4 can reuse it
+        self._largest_root = (
+            Location.objects.get(pk=largest_root_rows[0][0])
+            if largest_root_rows else None
+        )
 
         # Top 5 parents by direct-child count — impacts dropdown/list rendering
         self._info("")
@@ -306,12 +280,12 @@ class DatabasePerformanceDiagnostic(Job):
             )
 
     # ------------------------------------------------------------------
-    # 3. Query benchmarks
+    # 3. Location query benchmarks
     # ------------------------------------------------------------------
     def section_query_benchmarks(self):
         self._info("")
         self._info("=" * 60)
-        self._info("3. QUERY BENCHMARKS")
+        self._info("3. LOCATION QUERY BENCHMARKS")
         self._info("=" * 60)
 
         # --- Benchmark A: Full tree CTE ---
@@ -342,32 +316,11 @@ class DatabasePerformanceDiagnostic(Job):
         elif elapsed > 1:
             self._warning("  Execution time exceeds 1s threshold.")
 
-        # --- Benchmark B: Subtree of the largest root ---
+        # --- Benchmark B: Subtree of the largest root (reused from section 2) ---
         self._info("")
         self._info("B) Subtree lookup for the largest root location:")
 
-        # Find root with the most total descendants (not just direct children)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                WITH RECURSIVE tree AS (
-                    SELECT id, id AS root_id
-                    FROM dcim_location WHERE parent_id IS NULL
-                    UNION ALL
-                    SELECT loc.id, tree.root_id
-                    FROM dcim_location loc
-                    JOIN tree ON loc.parent_id = tree.id
-                )
-                SELECT root_id, count(*) AS cnt
-                FROM tree
-                GROUP BY root_id
-                ORDER BY cnt DESC
-                LIMIT 1
-                """
-            )
-            row = cursor.fetchone()
-        largest_root = Location.objects.get(pk=row[0]) if row else None
-
+        largest_root = self._largest_root
         if largest_root:
             with connection.cursor() as cursor:
                 start = time.perf_counter()
@@ -510,27 +463,8 @@ class DatabasePerformanceDiagnostic(Job):
                 (f"Location search: q={search_term}", LocationFilterSet, f"q={search_term}")
             )
 
-        # Parent filter (TreeNodeMultipleChoiceFilter) with the largest root
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                WITH RECURSIVE tree AS (
-                    SELECT id, id AS root_id
-                    FROM dcim_location WHERE parent_id IS NULL
-                    UNION ALL
-                    SELECT loc.id, tree.root_id
-                    FROM dcim_location loc
-                    JOIN tree ON loc.parent_id = tree.id
-                )
-                SELECT root_id, count(*) AS cnt
-                FROM tree
-                GROUP BY root_id
-                ORDER BY cnt DESC
-                LIMIT 1
-                """
-            )
-            row = cursor.fetchone()
-        largest_root = Location.objects.get(pk=row[0]) if row else None
+        # Parent filter (TreeNodeMultipleChoiceFilter) — reuse largest root from section 2
+        largest_root = self._largest_root
         if largest_root:
             test_cases.append((
                 f"Location parent={largest_root.name}",
@@ -714,65 +648,259 @@ class DatabasePerformanceDiagnostic(Job):
         self._info("6. INDEX CHECK")
         self._info("=" * 60)
 
-        # pg_trgm extension check
+        # --- pg_trgm extension ---
         with connection.cursor() as cursor:
             cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'")
             has_trgm = cursor.fetchone() is not None
-
+        self._info("")
         if has_trgm:
             self._info("pg_trgm extension: INSTALLED")
         else:
-            self._warning("pg_trgm extension: MISSING")
+            self._warning("pg_trgm extension: MISSING (all trigram checks below will show MISSING)")
 
-        # Scan all public-schema tables for a 'name' column and check trigram coverage
+        # --- Trigram indexes on 'name' columns (>1000 rows only, sorted desc) ---
         self._info("")
-        self._info("Trigram index coverage on 'name' columns (all Nautobot tables):")
+        self._info("--- Trigram 'name' index coverage (tables >1,000 rows) ---")
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT c.table_name, c.data_type,
-                       (SELECT reltuples::bigint FROM pg_class
-                        WHERE relname = c.table_name AND relkind = 'r') AS approx_rows
+                SELECT c.table_name,
+                       pc.reltuples::bigint AS approx_rows
                 FROM information_schema.columns c
+                JOIN pg_class pc ON pc.relname = c.table_name AND pc.relkind = 'r'
+                JOIN pg_namespace pn ON pn.oid = pc.relnamespace AND pn.nspname = 'public'
                 WHERE c.table_schema = 'public'
                   AND c.column_name = 'name'
                   AND c.data_type IN ('character varying', 'text', 'character')
-                ORDER BY c.table_name
+                  AND pc.reltuples > 1000
+                ORDER BY pc.reltuples DESC
                 """
             )
             name_tables = cursor.fetchall()
 
-        missing_trigram = []
-        with connection.cursor() as cursor:
-            for table_name, _data_type, approx_rows in name_tables:
-                cursor.execute(
-                    "SELECT indexname FROM pg_indexes "
-                    "WHERE tablename = %s AND indexdef LIKE %s",
-                    [table_name, "%trgm%"],
-                )
-                trgm_idx = cursor.fetchone()
-                if trgm_idx:
-                    self._info(
-                        "  %-50s rows=%-12s trigram: %s",
-                        table_name, f"{approx_rows or 0:,}", trgm_idx[0],
+        if not name_tables:
+            self._info("  (No tables with >1,000 rows and a 'name' column)")
+        else:
+            self._info("  %-50s %12s  %s", "Table", "Rows", "Trigram index")
+            with connection.cursor() as cursor:
+                for table_name, approx_rows in name_tables:
+                    cursor.execute(
+                        "SELECT indexname FROM pg_indexes "
+                        "WHERE tablename = %s AND indexdef LIKE %s",
+                        [table_name, "%trgm%"],
                     )
-                else:
+                    trgm_idx = cursor.fetchone()
+                    status = trgm_idx[0] if trgm_idx else "MISSING"
                     self._info(
-                        "  %-50s rows=%-12s trigram: MISSING",
-                        table_name, f"{approx_rows or 0:,}",
+                        "  %-50s %12s  %s", table_name, f"{approx_rows:,}", status,
                     )
-                    if (approx_rows or 0) > 1000:
-                        missing_trigram.append((table_name, approx_rows))
+                    if not trgm_idx:
+                        self._warning(
+                            "Table '%s' (~%s rows) has no trigram index on 'name'.",
+                            table_name, f"{approx_rows:,}",
+                        )
 
-        for table_name, approx_rows in missing_trigram:
-            self._warning(
-                "Table '%s' (~%s rows) has no trigram index on 'name'.",
-                table_name, f"{approx_rows:,}",
-            )
-
-        # Parent ID index check (location-specific — known tree-join hot path)
+        # --- JSONB GIN indexes on _custom_field_data columns (>1000 rows) ---
         self._info("")
-        self._info("Parent ID indexes on dcim_location:")
+        self._info("--- JSONB GIN index coverage on '_custom_field_data' (tables >1,000 rows) ---")
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT c.table_name, pc.reltuples::bigint AS approx_rows
+                FROM information_schema.columns c
+                JOIN pg_class pc ON pc.relname = c.table_name AND pc.relkind = 'r'
+                JOIN pg_namespace pn ON pn.oid = pc.relnamespace AND pn.nspname = 'public'
+                WHERE c.table_schema = 'public'
+                  AND c.column_name = '_custom_field_data'
+                  AND pc.reltuples > 1000
+                ORDER BY pc.reltuples DESC
+                """
+            )
+            cfd_tables = cursor.fetchall()
+
+        if not cfd_tables:
+            self._info("  (No tables with >1,000 rows and a '_custom_field_data' column)")
+        else:
+            self._info("  %-50s %12s  %s", "Table", "Rows", "GIN index")
+            with connection.cursor() as cursor:
+                for table_name, approx_rows in cfd_tables:
+                    cursor.execute(
+                        "SELECT indexname FROM pg_indexes "
+                        "WHERE tablename = %s "
+                        "AND indexdef ILIKE %s "
+                        "AND indexdef ILIKE %s",
+                        [table_name, "%_custom_field_data%", "%gin%"],
+                    )
+                    gin_idx = cursor.fetchone()
+                    status = gin_idx[0] if gin_idx else "MISSING"
+                    self._info(
+                        "  %-50s %12s  %s", table_name, f"{approx_rows:,}", status,
+                    )
+                    if not gin_idx:
+                        self._warning(
+                            "Table '%s' (~%s rows) has no GIN index on '_custom_field_data'.",
+                            table_name, f"{approx_rows:,}",
+                        )
+
+        # --- GiST/GIN indexes on inet/cidr columns (network containment queries) ---
+        self._info("")
+        self._info("--- Network-type (inet/cidr) column index coverage ---")
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT c.table_name, c.column_name, c.data_type,
+                       COALESCE(pc.reltuples::bigint, 0) AS approx_rows
+                FROM information_schema.columns c
+                LEFT JOIN pg_class pc ON pc.relname = c.table_name AND pc.relkind = 'r'
+                LEFT JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+                WHERE c.table_schema = 'public'
+                  AND c.data_type IN ('inet', 'cidr')
+                  AND (pn.nspname = 'public' OR pn.nspname IS NULL)
+                ORDER BY approx_rows DESC, c.table_name, c.column_name
+                """
+            )
+            network_cols = cursor.fetchall()
+
+        if not network_cols:
+            self._info("  (No inet/cidr columns found)")
+        else:
+            self._info(
+                "  %-40s %-25s %-8s %10s  %s",
+                "Table", "Column", "Type", "Rows", "Index (type)",
+            )
+            with connection.cursor() as cursor:
+                for table_name, column_name, data_type, approx_rows in network_cols:
+                    cursor.execute(
+                        """
+                        SELECT i.relname, am.amname
+                        FROM pg_index idx
+                        JOIN pg_class c ON c.oid = idx.indrelid
+                        JOIN pg_class i ON i.oid = idx.indexrelid
+                        JOIN pg_am am ON am.oid = i.relam
+                        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(idx.indkey)
+                        WHERE c.relname = %s AND a.attname = %s
+                        """,
+                        [table_name, column_name],
+                    )
+                    idx_rows = cursor.fetchall()
+                    if idx_rows:
+                        descriptions = ", ".join(f"{name} ({amname})" for name, amname in idx_rows)
+                    else:
+                        descriptions = "MISSING"
+                    self._info(
+                        "  %-40s %-25s %-8s %10s  %s",
+                        table_name, column_name, data_type,
+                        f"{approx_rows:,}", descriptions,
+                    )
+                    if not idx_rows and approx_rows > 1000:
+                        self._warning(
+                            "%s.%s (%s, ~%s rows) has no index — "
+                            "containment queries will seq-scan.",
+                            table_name, column_name, data_type, f"{approx_rows:,}",
+                        )
+
+        # --- Unused indexes (idx_scan = 0, non-unique, non-primary) ---
+        self._info("")
+        self._info("--- Unused indexes (idx_scan=0, excluding unique/primary) — top 20 by size ---")
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    s.relname AS table_name,
+                    s.indexrelname AS index_name,
+                    pg_size_pretty(pg_relation_size(s.indexrelid)) AS size,
+                    pg_relation_size(s.indexrelid) AS size_bytes
+                FROM pg_stat_user_indexes s
+                JOIN pg_index i ON i.indexrelid = s.indexrelid
+                WHERE s.schemaname = 'public'
+                  AND s.idx_scan = 0
+                  AND NOT i.indisunique
+                  AND NOT i.indisprimary
+                ORDER BY pg_relation_size(s.indexrelid) DESC
+                LIMIT 20
+                """
+            )
+            unused_rows = cursor.fetchall()
+
+        if not unused_rows:
+            self._info("  (None found)")
+        else:
+            self._info("  %-42s %-50s %10s", "Table", "Index", "Size")
+            for table_name, index_name, size, _size_bytes in unused_rows:
+                self._info("  %-42s %-50s %10s", table_name, index_name, size)
+
+        # --- Per-table index inventory (tables >1,000 rows) ---
+        self._info("")
+        self._info("--- Per-table index inventory (tables >1,000 rows) ---")
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT t.relname, t.reltuples::bigint, s.seq_scan, s.idx_scan
+                FROM pg_class t
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                LEFT JOIN pg_stat_user_tables s ON s.relid = t.oid
+                WHERE n.nspname = 'public'
+                  AND t.relkind = 'r'
+                  AND t.reltuples > 1000
+                ORDER BY t.reltuples DESC
+                """
+            )
+            large_tables = cursor.fetchall()
+
+        for table_name, rows, seq_scan, idx_scan in large_tables:
+            self._info("")
+            self._info(
+                "  %s  (rows=%s, seq_scan=%s, idx_scan=%s)",
+                table_name, f"{rows:,}",
+                f"{seq_scan or 0:,}", f"{idx_scan or 0:,}",
+            )
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        i.relname AS index_name,
+                        am.amname AS index_type,
+                        idx.indisunique,
+                        idx.indisprimary,
+                        array_to_string(
+                            array_agg(a.attname ORDER BY
+                                array_position(idx.indkey::int[], a.attnum::int)),
+                            ', '
+                        ) AS columns,
+                        COALESCE(s.idx_scan, 0) AS scans,
+                        pg_size_pretty(pg_relation_size(i.oid)) AS size
+                    FROM pg_class t
+                    JOIN pg_index idx ON idx.indrelid = t.oid
+                    JOIN pg_class i ON i.oid = idx.indexrelid
+                    JOIN pg_am am ON am.oid = i.relam
+                    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(idx.indkey)
+                    LEFT JOIN pg_stat_user_indexes s ON s.indexrelid = i.oid
+                    WHERE t.relname = %s
+                    GROUP BY i.relname, am.amname, idx.indisunique,
+                             idx.indisprimary, s.idx_scan, i.oid
+                    ORDER BY idx.indisprimary DESC, idx.indisunique DESC, i.relname
+                    """,
+                    [table_name],
+                )
+                idx_rows = cursor.fetchall()
+
+            if not idx_rows:
+                self._info("    (no indexes found)")
+                continue
+            self._info(
+                "    %-55s %-8s %-7s %-40s %10s %10s",
+                "Index", "Type", "Unique", "Columns", "Scans", "Size",
+            )
+            for idx_name, idx_type, is_unique, is_primary, columns, scans, size in idx_rows:
+                flags = "PK" if is_primary else ("UNIQ" if is_unique else "")
+                self._info(
+                    "    %-55s %-8s %-7s %-40s %10s %10s",
+                    idx_name, idx_type, flags, columns, f"{scans:,}", size,
+                )
+
+        # --- Parent_id indexes on dcim_location (location-specific) ---
+        self._info("")
+        self._info("--- Parent ID indexes on dcim_location ---")
         with connection.cursor() as cursor:
             cursor.execute(
                 "SELECT indexname, indexdef FROM pg_indexes "
