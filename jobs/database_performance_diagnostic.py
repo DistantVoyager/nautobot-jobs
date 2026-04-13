@@ -83,6 +83,13 @@ class DatabasePerformanceDiagnostic(Job):
         self._lines = []
         self._real_logger = self.logger
 
+        self._lines.append("# Database Performance Diagnostic Report")
+        self._lines.append("")
+        self._lines.append(
+            "This report is intended for review by a domain expert or LLM. "
+            "All queries are read-only."
+        )
+
         sections = [
             ("Table sizes", self.section_table_sizes),
             ("Tree structure", self.section_tree_structure),
@@ -101,7 +108,7 @@ class DatabasePerformanceDiagnostic(Job):
 
         # Write full report to downloadable file
         content = "\n".join(self._lines)
-        filename = "database_performance_report.txt"
+        filename = "database_performance_report.md"
         try:
             self.create_file(filename, content)
             self._real_logger.info(
@@ -116,31 +123,88 @@ class DatabasePerformanceDiagnostic(Job):
                 self._real_logger.info(line)
 
     # ------------------------------------------------------------------
-    # Output helpers — write to buffer; only warnings/errors also go to log
+    # Output helpers — write to buffer; warnings/errors also go to log
     # ------------------------------------------------------------------
     def _info(self, message, *args):
         self._lines.append(message % args if args else message)
 
     def _warning(self, message, *args):
         formatted = message % args if args else message
-        self._lines.append("[WARNING] " + formatted)
+        self._lines.append(f"> ⚠️ **WARNING:** {formatted}")
+        self._lines.append("")
         self._real_logger.warning(message, *args)
 
     def _error(self, message, *args):
         formatted = message % args if args else message
-        self._lines.append("[ERROR] " + formatted)
+        self._lines.append(f"> 🛑 **ERROR:** {formatted}")
+        self._lines.append("")
         self._real_logger.error(message, *args)
+
+    def _h1(self, text):
+        self._lines.append("")
+        self._lines.append(f"# {text}")
+        self._lines.append("")
+
+    def _h2(self, text):
+        self._lines.append("")
+        self._lines.append(f"## {text}")
+        self._lines.append("")
+
+    def _h3(self, text):
+        self._lines.append("")
+        self._lines.append(f"### {text}")
+        self._lines.append("")
+
+    def _h4(self, text):
+        self._lines.append("")
+        self._lines.append(f"#### {text}")
+        self._lines.append("")
+
+    def _code_block(self, content, language=""):
+        self._lines.append(f"```{language}")
+        if isinstance(content, str):
+            for line in content.splitlines():
+                self._lines.append(line)
+        else:
+            for line in content:
+                self._lines.append(line)
+        self._lines.append("```")
+        self._lines.append("")
+
+    def _table(self, headers, rows):
+        """Emit a GFM markdown table. All cells coerced to str."""
+        def _escape(cell):
+            s = "" if cell is None else str(cell)
+            return s.replace("|", "\\|").replace("\n", " ")
+        self._lines.append("| " + " | ".join(_escape(h) for h in headers) + " |")
+        self._lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+        for row in rows:
+            self._lines.append("| " + " | ".join(_escape(c) for c in row) + " |")
+        self._lines.append("")
+
+    def _details(self, summary, content_lines, language=""):
+        """Collapsible section (renders in GitHub/VS Code markdown viewers)."""
+        self._lines.append(f"<details><summary>{summary}</summary>")
+        self._lines.append("")
+        self._lines.append(f"```{language}")
+        if isinstance(content_lines, str):
+            for line in content_lines.splitlines():
+                self._lines.append(line)
+        else:
+            for line in content_lines:
+                self._lines.append(line)
+        self._lines.append("```")
+        self._lines.append("")
+        self._lines.append("</details>")
+        self._lines.append("")
 
     # ------------------------------------------------------------------
     # 1. Table sizes
     # ------------------------------------------------------------------
     def section_table_sizes(self):
-        self._info("=" * 60)
-        self._info("1. TABLE SIZES")
-        self._info("=" * 60)
+        self._h2("1. Table Sizes")
 
-        # Top 20 tables by total disk size (database-wide)
-        self._info("Top 20 tables by total disk size:")
+        self._h3("Top 20 tables by total disk size")
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -160,29 +224,25 @@ class DatabasePerformanceDiagnostic(Job):
             )
             rows = cursor.fetchall()
 
-        self._info(
-            "  %-45s %12s %12s %12s %14s",
-            "Table", "Total", "Data", "Indexes", "Approx rows",
+        self._table(
+            ["Table", "Total", "Data", "Indexes", "Approx rows"],
+            [
+                (table_name, total, data, indexes, f"{approx_rows:,}")
+                for table_name, total, data, indexes, approx_rows in rows
+            ],
         )
-        for table_name, total, data, indexes, approx_rows in rows:
-            self._info(
-                "  %-45s %12s %12s %12s %14s",
-                table_name, total, data, indexes, f"{approx_rows:,}",
-            )
 
     # ------------------------------------------------------------------
     # 2. Tree structure
     # ------------------------------------------------------------------
     def section_tree_structure(self):
+        self._h2("2. Location Tree Structure")
         self._info("")
-        self._info("=" * 60)
-        self._info("2. LOCATION TREE STRUCTURE")
-        self._info("=" * 60)
 
         root_count = Location.objects.filter(parent__isnull=True).count()
-        self._info("Root locations (no parent): %s", f"{root_count:,}")
+        self._info(f"**Root locations (no parent):** {root_count:,}")
 
-        # Depth distribution via raw SQL (ORM can't do this efficiently)
+        self._h3("Tree depth distribution")
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -202,10 +262,10 @@ class DatabasePerformanceDiagnostic(Job):
             )
             rows = cursor.fetchall()
 
-        self._info("Tree depth distribution:")
-        for depth, cnt in rows:
-            bar = "#" * min(cnt // max(1, sum(r[1] for r in rows) // 40), 40)
-            self._info("  Depth %d: %s locations %s", depth, f"{cnt:>12,}", bar)
+        self._table(
+            ["Depth", "Location count"],
+            [(depth, f"{cnt:,}") for depth, cnt in rows],
+        )
 
         max_depth = rows[-1][0] if rows else 0
         if max_depth > 10:
@@ -213,9 +273,7 @@ class DatabasePerformanceDiagnostic(Job):
                 "Tree depth of %d is deep. Each level adds cost to recursive CTEs.", max_depth
             )
 
-        # Largest subtrees
-        self._info("")
-        self._info("Top 10 largest root subtrees:")
+        self._h3("Top 10 largest root subtrees (by total descendants)")
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -237,20 +295,21 @@ class DatabasePerformanceDiagnostic(Job):
                 """
             )
             largest_root_rows = cursor.fetchall()
-        for _root_id, name, desc_count, loc_type in largest_root_rows:
-            self._info(
-                "  %-40s  type=%-15s  descendants=%s",
-                name, loc_type, f"{desc_count:,}",
-            )
+        self._table(
+            ["Root", "Location type", "Descendants"],
+            [
+                (name, loc_type, f"{desc_count:,}")
+                for _root_id, name, desc_count, loc_type in largest_root_rows
+            ],
+        )
         # Stash the top one so sections 3 and 4 can reuse it
         self._largest_root = (
             Location.objects.get(pk=largest_root_rows[0][0])
             if largest_root_rows else None
         )
 
-        # Top 5 parents by direct-child count — impacts dropdown/list rendering
-        self._info("")
-        self._info("Top 5 parents by direct-child count:")
+        self._h3("Top 5 parents by direct-child count")
+        self._info("_Large direct-child counts can slow parent-selection dropdown/list rendering._")
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -268,29 +327,24 @@ class DatabasePerformanceDiagnostic(Job):
                 """
             )
             widest_rows = cursor.fetchall()
-        for p_name, p_type, c_count in widest_rows:
-            self._info(
-                "  %-40s  type=%-15s  direct_children=%s",
-                p_name, p_type, f"{c_count:,}",
-            )
+        self._table(
+            ["Parent", "Location type", "Direct children"],
+            [(p_name, p_type, f"{c_count:,}") for p_name, p_type, c_count in widest_rows],
+        )
         if widest_rows and widest_rows[0][2] > 500:
             self._warning(
-                "Largest parent has %d direct children — parent-selection widgets "
-                "may render slowly.", widest_rows[0][2],
+                "Largest parent has %d direct children.", widest_rows[0][2],
             )
 
     # ------------------------------------------------------------------
     # 3. Location query benchmarks
     # ------------------------------------------------------------------
     def section_query_benchmarks(self):
-        self._info("")
-        self._info("=" * 60)
-        self._info("3. LOCATION QUERY BENCHMARKS")
-        self._info("=" * 60)
+        self._h2("3. Location Query Benchmarks")
 
         # --- Benchmark A: Full tree CTE ---
-        self._info("")
-        self._info("A) Full tree recursive CTE (what TreeNodeMultipleChoiceFilter triggers):")
+        self._h3("A) Full tree recursive CTE")
+        self._info("_This is what `TreeNodeMultipleChoiceFilter` triggers on any location-filtered page._")
 
         with connection.cursor() as cursor:
             start = time.perf_counter()
@@ -310,15 +364,14 @@ class DatabasePerformanceDiagnostic(Job):
             elapsed = time.perf_counter() - start
             count = cursor.fetchone()[0]
 
-        self._info("  Traversed %s nodes in %.2f seconds", f"{count:,}", elapsed)
+        self._info(f"Traversed **{count:,}** nodes in **{elapsed:.2f}s**.")
         if elapsed > 5:
-            self._warning("  Execution time exceeds 5s threshold.")
+            self._warning("Execution time exceeds 5s threshold.")
         elif elapsed > 1:
-            self._warning("  Execution time exceeds 1s threshold.")
+            self._warning("Execution time exceeds 1s threshold.")
 
         # --- Benchmark B: Subtree of the largest root (reused from section 2) ---
-        self._info("")
-        self._info("B) Subtree lookup for the largest root location:")
+        self._h3("B) Subtree lookup for the largest root")
 
         largest_root = self._largest_root
         if largest_root:
@@ -341,20 +394,17 @@ class DatabasePerformanceDiagnostic(Job):
                 count = cursor.fetchone()[0]
 
             self._info(
-                '  Root "%s" — %s descendants in %.2f seconds',
-                largest_root.name, f"{count:,}", elapsed,
+                f'Root `{largest_root.name}` — **{count:,}** descendants in **{elapsed:.2f}s**.'
             )
         else:
-            self._info("  No root locations found.")
+            self._info("_No root locations found._")
 
         # --- Benchmark C: ILIKE search (what ?q= does) ---
-        self._info("")
-        self._info("C) ILIKE search simulation (?q= filter):")
+        self._h3("C) ILIKE search simulation (`?q=` filter)")
 
-        # Pick a realistic search term from existing data
         sample_loc = Location.objects.first()
         if sample_loc and sample_loc.name:
-            search_term = sample_loc.name[:4]  # first 4 chars
+            search_term = sample_loc.name[:4]
         else:
             search_term = "DC"
 
@@ -368,36 +418,30 @@ class DatabasePerformanceDiagnostic(Job):
             count = cursor.fetchone()[0]
 
         self._info(
-            '  Search for "%%%s%%" — %s matches in %.2f seconds',
-            search_term, f"{count:,}", elapsed,
+            f'Search for `%{search_term}%` — **{count:,}** matches in **{elapsed:.2f}s**.'
         )
 
-        # Check if it used a seq scan
         with connection.cursor() as cursor:
             cursor.execute(
                 "EXPLAIN (FORMAT TEXT) SELECT count(*) FROM dcim_location WHERE name ILIKE %s",
                 [f"%{search_term}%"],
             )
-            plan = "\n".join(row[0] for row in cursor.fetchall())
+            plan_lines = [row[0] for row in cursor.fetchall()]
+            plan = "\n".join(plan_lines)
 
+        self._info("**Query plan:**")
+        self._code_block(plan_lines)
         if "Seq Scan" in plan:
-            self._warning("  Plan uses Sequential Scan.")
-        self._info("  Query plan: %s", plan.split("\n")[0].strip())
+            self._warning("Plan uses Sequential Scan.")
 
         # --- Benchmark D: Device count by location (StatsPanel) ---
-        self._info("")
-        self._info("D) Device count for a location (what StatsPanel computes):")
+        self._h3("D) Device count for a location (StatsPanel)")
 
         if largest_root:
             start = time.perf_counter()
             device_count = Device.objects.filter(location=largest_root).count()
-            elapsed = time.perf_counter() - start
-            self._info(
-                '  Devices at "%s": %s in %.2f seconds (direct, no descendants)',
-                largest_root.name, f"{device_count:,}", elapsed,
-            )
+            elapsed_direct = time.perf_counter() - start
 
-            # Now with descendants (the expensive version)
             with connection.cursor() as cursor:
                 start = time.perf_counter()
                 cursor.execute(
@@ -413,68 +457,72 @@ class DatabasePerformanceDiagnostic(Job):
                     """,
                     [str(largest_root.pk)],
                 )
-                elapsed = time.perf_counter() - start
+                elapsed_with_desc = time.perf_counter() - start
                 count = cursor.fetchone()[0]
 
-            self._info(
-                '  Devices at "%s" + all descendants: %s in %.2f seconds',
-                largest_root.name, f"{count:,}", elapsed,
+            self._table(
+                ["Query", "Result", "Time"],
+                [
+                    (f"Direct at `{largest_root.name}`", f"{device_count:,} devices", f"{elapsed_direct:.2f}s"),
+                    (f"`{largest_root.name}` + descendants", f"{count:,} devices", f"{elapsed_with_desc:.2f}s"),
+                ],
             )
-            if elapsed > 3:
-                self._warning("  Execution time exceeds 3s threshold.")
+            if elapsed_with_desc > 3:
+                self._warning("Descendant query exceeds 3s threshold.")
 
     # ------------------------------------------------------------------
     # 4. FilterSet benchmarks
     # ------------------------------------------------------------------
     def section_filterset_benchmarks(self):
-        """Benchmark actual FilterSet queries with pagination simulation and EXPLAIN."""
+        """Benchmark actual FilterSet list-view queries with EXPLAIN ANALYZE on both count and page slice."""
+        self._h2("4. FilterSet Benchmarks (Pagination Simulation)")
+        self._info(
+            "Each scenario below simulates a single page load of a filtered Nautobot "
+            "list view. Every list page issues **two** queries:"
+        )
         self._info("")
-        self._info("=" * 60)
-        self._info("4. FILTERSET BENCHMARKS (PAGINATION SIMULATION)")
-        self._info("=" * 60)
+        self._info("1. **Count query** — `SELECT COUNT(*)` over the full filtered queryset (drives the paginator)")
+        self._info("2. **Page query** — `SELECT ... LIMIT 50` for the current page's rows")
         self._info("")
         self._info(
-            "Every Nautobot list page runs TWO queries per page load:"
-        )
-        self._info(
-            "  1) COUNT(*) over the full filtered queryset (for the paginator)"
-        )
-        self._info(
-            "  2) SELECT with LIMIT/OFFSET (for the current page of results)"
-        )
-        self._info(
-            "Both go through the FilterSet, so tree filters (parent=, location=)"
-        )
-        self._info(
-            "trigger recursive CTEs on EVERY page load, EVERY page navigation."
+            "Both queries go through the same FilterSet. Tree filters like `parent=` "
+            "or `location=` trigger recursive CTEs on **every page load, every page "
+            "navigation**. Each scenario captures timing, generated SQL, and an "
+            "`EXPLAIN ANALYZE` plan for **both** queries."
         )
 
-        # Build default test cases: (label, filterset_class, query_string)
+        # Build default test cases: (label, url_path, filterset_class, query_string)
         test_cases = []
 
         # Baseline: location list page with no filters
-        test_cases.append(("Location list (no filters)", LocationFilterSet, ""))
+        test_cases.append((
+            "Location list page (no filters)",
+            "/dcim/locations/",
+            LocationFilterSet, "",
+        ))
 
         # Search filter (?q=)
         sample_loc = Location.objects.first()
         if sample_loc and sample_loc.name:
             search_term = sample_loc.name[:4]
-            test_cases.append(
-                (f"Location search: q={search_term}", LocationFilterSet, f"q={search_term}")
-            )
+            test_cases.append((
+                f"Location list with ?q= search (term={search_term!r})",
+                f"/dcim/locations/?q={search_term}",
+                LocationFilterSet, f"q={search_term}",
+            ))
 
         # Parent filter (TreeNodeMultipleChoiceFilter) — reuse largest root from section 2
         largest_root = self._largest_root
         if largest_root:
             test_cases.append((
-                f"Location parent={largest_root.name}",
-                LocationFilterSet,
-                f"parent={largest_root.pk}",
+                f"Location list filtered by parent={largest_root.name}",
+                f"/dcim/locations/?parent={largest_root.pk}",
+                LocationFilterSet, f"parent={largest_root.pk}",
             ))
             test_cases.append((
-                f"Devices at location={largest_root.name}",
-                DeviceFilterSet,
-                f"location={largest_root.pk}",
+                f"Device list filtered by location={largest_root.name}",
+                f"/dcim/devices/?location={largest_root.pk}",
+                DeviceFilterSet, f"location={largest_root.pk}",
             ))
 
         # Custom filter params from user input
@@ -487,22 +535,27 @@ class DatabasePerformanceDiagnostic(Job):
                 if line.lower().startswith("devices:"):
                     fs_class = DeviceFilterSet
                     query_str = line.split(":", 1)[1]
-                    label = f"Custom (Device): {query_str}"
+                    url_path = f"/dcim/devices/?{query_str}"
+                    scenario = f"Custom Device filter: {query_str}"
                 elif line.lower().startswith("locations:"):
                     fs_class = LocationFilterSet
                     query_str = line.split(":", 1)[1]
-                    label = f"Custom (Location): {query_str}"
+                    url_path = f"/dcim/locations/?{query_str}"
+                    scenario = f"Custom Location filter: {query_str}"
                 else:
                     fs_class = LocationFilterSet
                     query_str = line
-                    label = f"Custom (Location): {line}"
-                test_cases.append((label, fs_class, query_str))
+                    url_path = f"/dcim/locations/?{line}"
+                    scenario = f"Custom Location filter: {line}"
+                test_cases.append((scenario, url_path, fs_class, query_str))
 
         # Run benchmarks
-        self._info("")
-        for label, fs_class, query_str in test_cases:
+        for idx, (scenario, url_path, fs_class, query_str) in enumerate(test_cases, 1):
             base_qs = Location.objects.all() if fs_class is LocationFilterSet else Device.objects.all()
             qd = QueryDict(query_str)
+            self._h3(f"Scenario {idx}: {scenario}")
+            self._info(f"**URL equivalent:** `{url_path}`")
+            self._info("")
             try:
                 filterset = fs_class(data=qd, queryset=base_qs)
                 qs = filterset.qs
@@ -521,57 +574,67 @@ class DatabasePerformanceDiagnostic(Job):
 
                 combined = count_elapsed + page_elapsed
 
-                self._info("  --- %s ---", label)
-                self._info(
-                    "    Results: %-8s  Count: %.3fs (%d queries)  Page: %.3fs (%d queries)  Total: %.3fs",
-                    f"{total:,}", count_elapsed, len(count_ctx),
-                    page_elapsed, len(page_ctx), combined,
+                # Summary table
+                self._table(
+                    ["Metric", "Count query", "Page query", "Combined"],
+                    [
+                        ["Time", f"{count_elapsed:.3f}s", f"{page_elapsed:.3f}s", f"{combined:.3f}s"],
+                        ["Queries issued", len(count_ctx), len(page_ctx), len(count_ctx) + len(page_ctx)],
+                        ["Rows matched (count)", f"{total:,}", "—", "—"],
+                    ],
                 )
 
                 if combined > 5:
-                    self._warning("    Combined time exceeds 5s threshold.")
+                    self._warning(f"Combined time {combined:.2f}s exceeds 5s threshold.")
                 elif combined > 2:
-                    self._warning("    Combined time exceeds 2s threshold.")
+                    self._warning(f"Combined time {combined:.2f}s exceeds 2s threshold.")
 
-                # Phase 3: EXPLAIN ANALYZE on the count query (usually the bottleneck)
-                if count_ctx.captured_queries:
-                    count_sql = count_ctx.captured_queries[-1]["sql"]
-                    self._info("    Count SQL: %s", count_sql[:200])
-                    with connection.cursor() as cursor:
-                        cursor.execute(
-                            "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) %s" % count_sql  # noqa: S608
-                        )
-                        plan_lines = [row[0] for row in cursor.fetchall()]
+                # Per-query detail: SQL + EXPLAIN
+                for phase_label, ctx in (
+                    ("Count query", count_ctx),
+                    ("Page query", page_ctx),
+                ):
+                    if not ctx.captured_queries:
+                        continue
+                    sql = ctx.captured_queries[-1]["sql"]
+                    self._h4(phase_label)
+                    self._code_block(sql, language="sql")
 
-                    self._info("    EXPLAIN ANALYZE (count query):")
-                    for plan_line in plan_lines:
-                        self._info("      %s", plan_line)
+                    try:
+                        with connection.cursor() as cursor:
+                            cursor.execute(
+                                "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) %s" % sql  # noqa: S608
+                            )
+                            plan_lines = [row[0] for row in cursor.fetchall()]
+                    except Exception as plan_err:
+                        self._warning("EXPLAIN failed for %s: %s", phase_label, str(plan_err))
+                        continue
 
-                    # Flag specific bottleneck patterns
                     plan_text = "\n".join(plan_lines)
-                    if "Seq Scan" in plan_text:
-                        self._warning("    Plan contains Sequential Scan.")
-                    if "Sort Method: external" in plan_text:
-                        self._warning("    Plan contains external (on-disk) sort.")
-                    if "Rows Removed by Filter" in plan_text:
-                        for plan_line in plan_lines:
-                            if "Rows Removed by Filter" in plan_line:
-                                self._info("    ^ %s", plan_line.strip())
+                    # Use collapsible block for very long plans (common for tree filters)
+                    if len(plan_text) > 2000:
+                        self._details(f"EXPLAIN ANALYZE plan ({phase_label}) — click to expand", plan_lines)
+                    else:
+                        self._info(f"**EXPLAIN ANALYZE ({phase_label}):**")
+                        self._code_block(plan_lines)
 
-                self._info("")
+                    if "Seq Scan" in plan_text:
+                        self._warning(f"{phase_label} plan contains Sequential Scan.")
+                    if "Sort Method: external" in plan_text:
+                        self._warning(f"{phase_label} plan contains external (on-disk) sort.")
+                    for plan_line in plan_lines:
+                        if "Rows Removed by Filter" in plan_line:
+                            self._info(f"- _{plan_line.strip()}_")
 
             except Exception as e:
-                self._error("  %s  ERROR: %s", label, str(e))
+                self._error("Scenario %d (%s) failed: %s", idx, scenario, str(e))
 
     # ------------------------------------------------------------------
     # 5. Concurrent load simulation
     # ------------------------------------------------------------------
     def section_concurrent_load(self):
         """Simulate concurrent tree CTE queries to test degradation under load."""
-        self._info("")
-        self._info("=" * 60)
-        self._info("5. CONCURRENT LOAD SIMULATION")
-        self._info("=" * 60)
+        self._h2("5. Concurrent Load Simulation")
 
         num_queries = min(max(int(self._concurrent_queries), 1), 20)
 
@@ -620,196 +683,200 @@ class DatabasePerformanceDiagnostic(Job):
             avg_time = sum(times) / len(times)
             max_time = max(times)
             min_time = min(times)
+            throughput = len(times) / wall_elapsed if wall_elapsed > 0 else 0
 
-            self._info("  Completed:    %d / %d queries", len(times), num_queries)
-            self._info("  Wall clock:   %.2f seconds", wall_elapsed)
-            self._info(
-                "  Per-query:    min=%.2fs  avg=%.2fs  max=%.2fs",
-                min_time, avg_time, max_time,
-            )
-            self._info(
-                "  Throughput:   %.1f queries/sec",
-                len(times) / wall_elapsed if wall_elapsed > 0 else 0,
+            self._table(
+                ["Metric", "Value"],
+                [
+                    ("Completed", f"{len(times)} / {num_queries}"),
+                    ("Wall clock", f"{wall_elapsed:.2f}s"),
+                    ("Per-query min", f"{min_time:.2f}s"),
+                    ("Per-query avg", f"{avg_time:.2f}s"),
+                    ("Per-query max", f"{max_time:.2f}s"),
+                    ("Throughput", f"{throughput:.1f} queries/sec"),
+                ],
             )
 
             if max_time > 10:
-                self._warning("  Max query time %.1fs exceeds 10s threshold.", max_time)
+                self._warning("Max query time %.1fs exceeds 10s threshold.", max_time)
             elif max_time > 5:
-                self._warning("  Max query time %.1fs exceeds 5s threshold.", max_time)
+                self._warning("Max query time %.1fs exceeds 5s threshold.", max_time)
             elif avg_time > 2:
-                self._warning("  Average query time %.1fs exceeds 2s threshold.", avg_time)
+                self._warning("Average query time %.1fs exceeds 2s threshold.", avg_time)
 
     # ------------------------------------------------------------------
     # 6. Index check
     # ------------------------------------------------------------------
     def section_index_check(self):
+        self._h2("6. Index Check")
+
+        self._info(
+            "This section audits index coverage on large tables (>1,000 rows). "
+            "It has two parts:"
+        )
         self._info("")
-        self._info("=" * 60)
-        self._info("6. INDEX CHECK")
-        self._info("=" * 60)
+        self._info(
+            "- **Part 1 — Coverage matrix:** flags *missing* specialized indexes "
+            "that Nautobot's query patterns need (trigram for `?q=` search, GIN "
+            "for custom-field filtering, GiST/btree for IP/prefix containment)."
+        )
+        self._info(
+            "- **Part 2 — Full index inventory:** lists *every* index that "
+            "actually exists on each large table, so a reviewer can verify "
+            "whether a specific column is already covered by some index."
+        )
 
         # --- pg_trgm extension ---
+        self._h3("pg_trgm extension")
         with connection.cursor() as cursor:
             cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'")
             has_trgm = cursor.fetchone() is not None
-        self._info("")
         if has_trgm:
-            self._info("pg_trgm extension: INSTALLED")
+            self._info("**Status:** INSTALLED")
         else:
-            self._warning("pg_trgm extension: MISSING (all trigram checks below will show MISSING)")
+            self._info("**Status:** MISSING")
+            self._warning(
+                "pg_trgm extension is not installed — trigram indexes cannot exist, "
+                "all `?q=` ILIKE searches will sequential-scan."
+            )
 
-        # --- Trigram indexes on 'name' columns (>1000 rows only, sorted desc) ---
-        self._info("")
-        self._info("--- Trigram 'name' index coverage (tables >1,000 rows) ---")
+        # --- Part 1: Coverage matrix ---
+        self._h3("Part 1 — Specialized index coverage matrix (tables >1,000 rows)")
+        self._info(
+            "Columns with `—` mean the column doesn't exist on this table (N/A). "
+            "`MISSING` means the column exists but has no appropriate specialized index."
+        )
+
+        # Gather the list of large tables and which special columns they have
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT c.table_name,
-                       pc.reltuples::bigint AS approx_rows
-                FROM information_schema.columns c
-                JOIN pg_class pc ON pc.relname = c.table_name AND pc.relkind = 'r'
-                JOIN pg_namespace pn ON pn.oid = pc.relnamespace AND pn.nspname = 'public'
-                WHERE c.table_schema = 'public'
-                  AND c.column_name = 'name'
-                  AND c.data_type IN ('character varying', 'text', 'character')
-                  AND pc.reltuples > 1000
-                ORDER BY pc.reltuples DESC
+                WITH large_tables AS (
+                    SELECT t.relname AS table_name, t.reltuples::bigint AS rows
+                    FROM pg_class t
+                    JOIN pg_namespace n ON n.oid = t.relnamespace
+                    WHERE n.nspname = 'public'
+                      AND t.relkind = 'r'
+                      AND t.reltuples > 1000
+                )
+                SELECT
+                    lt.table_name,
+                    lt.rows,
+                    bool_or(
+                        c.column_name = 'name'
+                        AND c.data_type IN ('character varying', 'text', 'character')
+                    ) AS has_name,
+                    bool_or(c.column_name = '_custom_field_data') AS has_cfd,
+                    bool_or(c.data_type IN ('inet', 'cidr')) AS has_network
+                FROM large_tables lt
+                LEFT JOIN information_schema.columns c
+                    ON c.table_schema = 'public' AND c.table_name = lt.table_name
+                GROUP BY lt.table_name, lt.rows
+                ORDER BY lt.rows DESC
                 """
             )
-            name_tables = cursor.fetchall()
+            coverage_tables = cursor.fetchall()
 
-        if not name_tables:
-            self._info("  (No tables with >1,000 rows and a 'name' column)")
-        else:
-            self._info("  %-50s %12s  %s", "Table", "Rows", "Trigram index")
-            with connection.cursor() as cursor:
-                for table_name, approx_rows in name_tables:
+        matrix_rows = []
+        critical_missing = []
+        with connection.cursor() as cursor:
+            for table_name, rows, has_name, has_cfd, has_network in coverage_tables:
+                # Trigram on name
+                if has_name:
                     cursor.execute(
                         "SELECT indexname FROM pg_indexes "
                         "WHERE tablename = %s AND indexdef LIKE %s",
                         [table_name, "%trgm%"],
                     )
-                    trgm_idx = cursor.fetchone()
-                    status = trgm_idx[0] if trgm_idx else "MISSING"
-                    self._info(
-                        "  %-50s %12s  %s", table_name, f"{approx_rows:,}", status,
-                    )
-                    if not trgm_idx:
-                        self._warning(
-                            "Table '%s' (~%s rows) has no trigram index on 'name'.",
-                            table_name, f"{approx_rows:,}",
-                        )
+                    trgm = cursor.fetchone()
+                    trgm_cell = trgm[0] if trgm else "**MISSING**"
+                    if not trgm:
+                        critical_missing.append((table_name, rows, "trigram on `name`"))
+                else:
+                    trgm_cell = "—"
 
-        # --- JSONB GIN indexes on _custom_field_data columns (>1000 rows) ---
-        self._info("")
-        self._info("--- JSONB GIN index coverage on '_custom_field_data' (tables >1,000 rows) ---")
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT c.table_name, pc.reltuples::bigint AS approx_rows
-                FROM information_schema.columns c
-                JOIN pg_class pc ON pc.relname = c.table_name AND pc.relkind = 'r'
-                JOIN pg_namespace pn ON pn.oid = pc.relnamespace AND pn.nspname = 'public'
-                WHERE c.table_schema = 'public'
-                  AND c.column_name = '_custom_field_data'
-                  AND pc.reltuples > 1000
-                ORDER BY pc.reltuples DESC
-                """
-            )
-            cfd_tables = cursor.fetchall()
-
-        if not cfd_tables:
-            self._info("  (No tables with >1,000 rows and a '_custom_field_data' column)")
-        else:
-            self._info("  %-50s %12s  %s", "Table", "Rows", "GIN index")
-            with connection.cursor() as cursor:
-                for table_name, approx_rows in cfd_tables:
+                # GIN on _custom_field_data
+                if has_cfd:
                     cursor.execute(
                         "SELECT indexname FROM pg_indexes "
                         "WHERE tablename = %s "
-                        "AND indexdef ILIKE %s "
-                        "AND indexdef ILIKE %s",
+                        "AND indexdef ILIKE %s AND indexdef ILIKE %s",
                         [table_name, "%_custom_field_data%", "%gin%"],
                     )
-                    gin_idx = cursor.fetchone()
-                    status = gin_idx[0] if gin_idx else "MISSING"
-                    self._info(
-                        "  %-50s %12s  %s", table_name, f"{approx_rows:,}", status,
-                    )
-                    if not gin_idx:
-                        self._warning(
-                            "Table '%s' (~%s rows) has no GIN index on '_custom_field_data'.",
-                            table_name, f"{approx_rows:,}",
-                        )
+                    gin = cursor.fetchone()
+                    gin_cell = gin[0] if gin else "**MISSING**"
+                    if not gin:
+                        critical_missing.append((table_name, rows, "GIN on `_custom_field_data`"))
+                else:
+                    gin_cell = "—"
 
-        # --- GiST/GIN indexes on inet/cidr columns (network containment queries) ---
-        self._info("")
-        self._info("--- Network-type (inet/cidr) column index coverage ---")
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT c.table_name, c.column_name, c.data_type,
-                       COALESCE(pc.reltuples::bigint, 0) AS approx_rows
-                FROM information_schema.columns c
-                LEFT JOIN pg_class pc ON pc.relname = c.table_name AND pc.relkind = 'r'
-                LEFT JOIN pg_namespace pn ON pn.oid = pc.relnamespace
-                WHERE c.table_schema = 'public'
-                  AND c.data_type IN ('inet', 'cidr')
-                  AND (pn.nspname = 'public' OR pn.nspname IS NULL)
-                ORDER BY approx_rows DESC, c.table_name, c.column_name
-                """
-            )
-            network_cols = cursor.fetchall()
-
-        if not network_cols:
-            self._info("  (No inet/cidr columns found)")
-        else:
-            self._info(
-                "  %-40s %-25s %-8s %10s  %s",
-                "Table", "Column", "Type", "Rows", "Index (type)",
-            )
-            with connection.cursor() as cursor:
-                for table_name, column_name, data_type, approx_rows in network_cols:
+                # Index on inet/cidr column (any type)
+                if has_network:
                     cursor.execute(
                         """
-                        SELECT i.relname, am.amname
+                        SELECT i.relname, am.amname, a.attname, col.data_type
                         FROM pg_index idx
                         JOIN pg_class c ON c.oid = idx.indrelid
                         JOIN pg_class i ON i.oid = idx.indexrelid
                         JOIN pg_am am ON am.oid = i.relam
-                        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(idx.indkey)
-                        WHERE c.relname = %s AND a.attname = %s
+                        JOIN pg_attribute a ON a.attrelid = c.oid
+                            AND a.attnum = ANY(idx.indkey)
+                        JOIN information_schema.columns col
+                            ON col.table_name = c.relname AND col.column_name = a.attname
+                        WHERE c.relname = %s
+                          AND col.data_type IN ('inet', 'cidr')
                         """,
-                        [table_name, column_name],
+                        [table_name],
                     )
-                    idx_rows = cursor.fetchall()
-                    if idx_rows:
-                        descriptions = ", ".join(f"{name} ({amname})" for name, amname in idx_rows)
-                    else:
-                        descriptions = "MISSING"
-                    self._info(
-                        "  %-40s %-25s %-8s %10s  %s",
-                        table_name, column_name, data_type,
-                        f"{approx_rows:,}", descriptions,
-                    )
-                    if not idx_rows and approx_rows > 1000:
-                        self._warning(
-                            "%s.%s (%s, ~%s rows) has no index — "
-                            "containment queries will seq-scan.",
-                            table_name, column_name, data_type, f"{approx_rows:,}",
+                    net_idx = cursor.fetchall()
+                    if net_idx:
+                        net_cell = ", ".join(
+                            f"{name} ({amname}) on `{attname}`"
+                            for name, amname, attname, _dt in net_idx
                         )
+                    else:
+                        net_cell = "**MISSING**"
+                        critical_missing.append((table_name, rows, "network-column index"))
+                else:
+                    net_cell = "—"
 
-        # --- Unused indexes (idx_scan = 0, non-unique, non-primary) ---
-        self._info("")
-        self._info("--- Unused indexes (idx_scan=0, excluding unique/primary) — top 20 by size ---")
+                matrix_rows.append((
+                    table_name, f"{rows:,}", trgm_cell, gin_cell, net_cell,
+                ))
+
+        if matrix_rows:
+            self._table(
+                [
+                    "Table", "Rows",
+                    "Trigram (`name`)",
+                    "GIN (`_custom_field_data`)",
+                    "Network (`inet`/`cidr`)",
+                ],
+                matrix_rows,
+            )
+        else:
+            self._info("_(No tables with >1,000 rows found)_")
+
+        # Emit a concise warning summary for the gaps surfaced above
+        for table_name, rows, gap_kind in critical_missing:
+            self._warning(
+                "%s (~%s rows) is missing %s index.",
+                table_name, f"{rows:,}", gap_kind,
+            )
+
+        # --- Unused indexes ---
+        self._h3("Unused indexes (top 20 by size)")
+        self._info(
+            "_Non-unique, non-primary indexes with `idx_scan = 0` since stats "
+            "were last reset. These incur write overhead without helping reads._"
+        )
         with connection.cursor() as cursor:
             cursor.execute(
                 """
                 SELECT
                     s.relname AS table_name,
                     s.indexrelname AS index_name,
-                    pg_size_pretty(pg_relation_size(s.indexrelid)) AS size,
-                    pg_relation_size(s.indexrelid) AS size_bytes
+                    pg_size_pretty(pg_relation_size(s.indexrelid)) AS size
                 FROM pg_stat_user_indexes s
                 JOIN pg_index i ON i.indexrelid = s.indexrelid
                 WHERE s.schemaname = 'public'
@@ -823,15 +890,16 @@ class DatabasePerformanceDiagnostic(Job):
             unused_rows = cursor.fetchall()
 
         if not unused_rows:
-            self._info("  (None found)")
+            self._info("_(None found)_")
         else:
-            self._info("  %-42s %-50s %10s", "Table", "Index", "Size")
-            for table_name, index_name, size, _size_bytes in unused_rows:
-                self._info("  %-42s %-50s %10s", table_name, index_name, size)
+            self._table(["Table", "Index", "Size"], unused_rows)
 
-        # --- Per-table index inventory (tables >1,000 rows) ---
-        self._info("")
-        self._info("--- Per-table index inventory (tables >1,000 rows) ---")
+        # --- Part 2: Full index inventory (collapsible per table) ---
+        self._h3("Part 2 — Full index inventory (tables >1,000 rows)")
+        self._info(
+            "_Each table below is collapsible. Expand to see every index that "
+            "currently exists on that table (PK, uniques, and regular indexes)._"
+        )
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -848,12 +916,6 @@ class DatabasePerformanceDiagnostic(Job):
             large_tables = cursor.fetchall()
 
         for table_name, rows, seq_scan, idx_scan in large_tables:
-            self._info("")
-            self._info(
-                "  %s  (rows=%s, seq_scan=%s, idx_scan=%s)",
-                table_name, f"{rows:,}",
-                f"{seq_scan or 0:,}", f"{idx_scan or 0:,}",
-            )
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -884,44 +946,35 @@ class DatabasePerformanceDiagnostic(Job):
                 )
                 idx_rows = cursor.fetchall()
 
+            summary = (
+                f"<code>{table_name}</code> — {rows:,} rows, "
+                f"{seq_scan or 0:,} seq scans, {idx_scan or 0:,} idx scans "
+                f"({len(idx_rows)} indexes)"
+            )
+            self._lines.append(f"<details><summary>{summary}</summary>")
+            self._lines.append("")
             if not idx_rows:
-                self._info("    (no indexes found)")
-                continue
-            self._info(
-                "    %-55s %-8s %-7s %-40s %10s %10s",
-                "Index", "Type", "Unique", "Columns", "Scans", "Size",
-            )
-            for idx_name, idx_type, is_unique, is_primary, columns, scans, size in idx_rows:
-                flags = "PK" if is_primary else ("UNIQ" if is_unique else "")
-                self._info(
-                    "    %-55s %-8s %-7s %-40s %10s %10s",
-                    idx_name, idx_type, flags, columns, f"{scans:,}", size,
-                )
-
-        # --- Parent_id indexes on dcim_location (location-specific) ---
-        self._info("")
-        self._info("--- Parent ID indexes on dcim_location ---")
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT indexname, indexdef FROM pg_indexes "
-                "WHERE tablename = 'dcim_location' AND indexdef LIKE '%%parent_id%%'"
-            )
-            parent_indexes = cursor.fetchall()
-        if parent_indexes:
-            for name, _defn in parent_indexes:
-                self._info("  %s", name)
-        else:
-            self._warning("  No parent_id indexes found.")
+                self._lines.append("_(no indexes found)_")
+            else:
+                headers = ["Index", "Type", "Flags", "Columns", "Scans", "Size"]
+                self._lines.append("| " + " | ".join(headers) + " |")
+                self._lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+                for idx_name, idx_type, is_unique, is_primary, columns, scans, size in idx_rows:
+                    flags = "PK" if is_primary else ("UNIQ" if is_unique else "")
+                    cells = [idx_name, idx_type, flags, columns, f"{scans:,}", size]
+                    self._lines.append(
+                        "| " + " | ".join(str(c).replace("|", "\\|") for c in cells) + " |"
+                    )
+            self._lines.append("")
+            self._lines.append("</details>")
+            self._lines.append("")
 
     # ------------------------------------------------------------------
     # 7. Connection & query diagnostics
     # ------------------------------------------------------------------
     def section_connection_diagnostics(self):
         """Check pg_stat_activity for connection and query health."""
-        self._info("")
-        self._info("=" * 60)
-        self._info("7. CONNECTION & QUERY DIAGNOSTICS")
-        self._info("=" * 60)
+        self._h2("7. Connection & Query Diagnostics")
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -935,29 +988,27 @@ class DatabasePerformanceDiagnostic(Job):
             )
             rows = cursor.fetchall()
 
-        self._info("")
-        self._info("Connection states (current database):")
+        self._h3("Connection states (current database)")
         total_conns = 0
+        conn_rows = []
         for state, count in rows:
             state_label = state or "NULL (background worker)"
-            self._info("  %-25s %d", state_label, count)
+            conn_rows.append((state_label, count))
             total_conns += count
-        self._info("  %-25s %d", "TOTAL", total_conns)
+        conn_rows.append(("**TOTAL**", total_conns))
+        self._table(["State", "Count"], conn_rows)
 
         with connection.cursor() as cursor:
             cursor.execute("SELECT setting FROM pg_settings WHERE name = 'max_connections'")
             max_conns = int(cursor.fetchone()[0])
 
         usage_pct = (total_conns / max_conns * 100) if max_conns > 0 else 0
-        self._info(
-            "  Usage: %d / %d (%.0f%%)", total_conns, max_conns, usage_pct
-        )
+        self._info(f"**Pool usage:** {total_conns} / {max_conns} ({usage_pct:.0f}%)")
         if usage_pct > 80:
-            self._warning("  Connection pool utilization %.0f%% exceeds 80%% threshold.", usage_pct)
+            self._warning("Connection pool utilization %.0f%% exceeds 80%% threshold.", usage_pct)
 
         # Long-running queries
-        self._info("")
-        self._info("Active queries running > 5 seconds:")
+        self._h3("Active queries running > 5 seconds")
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -965,7 +1016,7 @@ class DatabasePerformanceDiagnostic(Job):
                     pid,
                     now() - query_start AS duration,
                     state,
-                    left(query, 120) AS query_preview
+                    left(query, 200) AS query_preview
                 FROM pg_stat_activity
                 WHERE datname = current_database()
                   AND state = 'active'
@@ -977,20 +1028,19 @@ class DatabasePerformanceDiagnostic(Job):
             long_queries = cursor.fetchall()
 
         if long_queries:
-            for pid, duration, state, query_preview in long_queries:
-                self._warning(
-                    "  PID %s  running %s: %s...", pid, duration, query_preview
-                )
+            self._table(
+                ["PID", "Duration", "State", "Query preview"],
+                [(pid, str(duration), state, preview) for pid, duration, state, preview in long_queries],
+            )
             self._warning(
-                "  Found %d queries running longer than 5 seconds.",
+                "Found %d queries running longer than 5 seconds.",
                 len(long_queries),
             )
         else:
-            self._info("  None found (good).")
+            self._info("_None found._")
 
         # Blocked/waiting queries
-        self._info("")
-        self._info("Queries waiting on locks:")
+        self._h3("Queries waiting on locks")
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -1003,29 +1053,25 @@ class DatabasePerformanceDiagnostic(Job):
             blocked_count = cursor.fetchone()[0]
 
         if blocked_count > 0:
-            self._warning("  %d queries currently waiting on locks.", blocked_count)
+            self._warning("%d queries currently waiting on locks.", blocked_count)
         else:
-            self._info("  None found (good).")
+            self._info("_None found._")
 
     # ------------------------------------------------------------------
     # 8. Database statistics (cumulative)
     # ------------------------------------------------------------------
     def section_database_stats(self):
         """Cumulative stats — shows what has actually been slow over time."""
-        self._info("")
-        self._info("=" * 60)
-        self._info("8. DATABASE STATISTICS (CUMULATIVE)")
-        self._info("=" * 60)
+        self._h2("8. Database Statistics (Cumulative)")
 
         # --- pg_stat_statements: top queries by total time ---
-        self._info("")
-        self._info("--- Top queries by cumulative execution time ---")
+        self._h3("Top 10 queries by cumulative execution time")
         with connection.cursor() as cursor:
             cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements'")
             has_pgss = cursor.fetchone() is not None
 
         if not has_pgss:
-            self._info("  pg_stat_statements extension is NOT installed.")
+            self._info("_pg_stat_statements extension is **NOT** installed._")
         else:
             try:
                 with connection.cursor() as cursor:
@@ -1037,7 +1083,7 @@ class DatabasePerformanceDiagnostic(Job):
                             round(mean_exec_time::numeric, 2) AS mean_ms,
                             round((100.0 * total_exec_time /
                                 NULLIF(sum(total_exec_time) OVER (), 0))::numeric, 1) AS pct,
-                            left(regexp_replace(query, '\\s+', ' ', 'g'), 200) AS query_preview
+                            regexp_replace(query, '\\s+', ' ', 'g') AS query_text
                         FROM pg_stat_statements
                         WHERE query NOT LIKE '%%pg_stat_statements%%'
                           AND query NOT LIKE '%%EXPLAIN%%'
@@ -1046,19 +1092,23 @@ class DatabasePerformanceDiagnostic(Job):
                         """
                     )
                     rows = cursor.fetchall()
-                self._info("")
-                for idx, (total_ms, calls, mean_ms, pct, preview) in enumerate(rows, 1):
-                    self._info(
-                        "  #%d  total=%sms  calls=%s  avg=%sms  %s%% of DB time",
-                        idx, f"{total_ms:,}", f"{calls:,}", mean_ms, pct,
+                for idx, (total_ms, calls, mean_ms, pct, query_text) in enumerate(rows, 1):
+                    self._h4(f"#{idx} — {pct}% of total DB time")
+                    self._table(
+                        ["Metric", "Value"],
+                        [
+                            ("Total time (ms)", f"{total_ms:,}"),
+                            ("Calls", f"{calls:,}"),
+                            ("Avg time (ms)", mean_ms),
+                            ("% of all DB time", f"{pct}%"),
+                        ],
                     )
-                    self._info("      %s", preview)
+                    self._code_block(query_text, language="sql")
             except Exception as e:
-                self._warning("  Could not query pg_stat_statements: %s", str(e))
+                self._warning("Could not query pg_stat_statements: %s", str(e))
 
         # --- Sequential scans vs index scans per table ---
-        self._info("")
-        self._info("--- Sequential scans vs index scans (tables with >1K rows) ---")
+        self._h3("Sequential vs index scans (tables with >1K rows, top 15)")
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -1080,15 +1130,13 @@ class DatabasePerformanceDiagnostic(Job):
             )
             scan_rows = cursor.fetchall()
 
-        self._info(
-            "  %-42s %12s %12s %12s %7s",
-            "Table", "Seq scans", "Idx scans", "Rows", "Seq %",
+        self._table(
+            ["Table", "Seq scans", "Idx scans", "Rows", "Seq %"],
+            [
+                (relname, f"{seq:,}", f"{idx:,}", f"{n_rows:,}", f"{seq_pct}%")
+                for relname, seq, idx, n_rows, seq_pct in scan_rows
+            ],
         )
-        for relname, seq, idx, n_rows, seq_pct in scan_rows:
-            self._info(
-                "  %-42s %12s %12s %12s %6s%%",
-                relname, f"{seq:,}", f"{idx:,}", f"{n_rows:,}", seq_pct,
-            )
         # Flag tables doing heavy sequential scanning
         for relname, seq, idx, n_rows, seq_pct in scan_rows:
             if seq_pct > 50 and n_rows > 10000 and seq > 100:
@@ -1098,8 +1146,7 @@ class DatabasePerformanceDiagnostic(Job):
                 )
 
         # --- Buffer cache hit ratio ---
-        self._info("")
-        self._info("--- Buffer cache hit ratio ---")
+        self._h3("Buffer cache hit ratio")
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -1118,9 +1165,13 @@ class DatabasePerformanceDiagnostic(Job):
 
         if row:
             disk, hits, ratio = row
-            self._info(
-                "  Disk reads: %s  |  Cache hits: %s  |  Hit ratio: %s%%",
-                f"{disk:,}", f"{hits:,}", ratio,
+            self._table(
+                ["Metric", "Value"],
+                [
+                    ("Disk reads", f"{disk:,}"),
+                    ("Cache hits", f"{hits:,}"),
+                    ("Hit ratio", f"{ratio}%"),
+                ],
             )
             if ratio and ratio < 99:
                 self._warning("Cache hit ratio %s%% below 99%% threshold.", ratio)
@@ -1134,10 +1185,7 @@ class DatabasePerformanceDiagnostic(Job):
         if not query:
             return  # Skip section entirely if no query provided
 
-        self._info("")
-        self._info("=" * 60)
-        self._info("9. AD-HOC EXPLAIN ANALYZE")
-        self._info("=" * 60)
+        self._h2("9. Ad-hoc EXPLAIN ANALYZE")
         self._info("")
 
         # Safety: only allow read-only queries
@@ -1161,10 +1209,8 @@ class DatabasePerformanceDiagnostic(Job):
                 )
                 return
 
-        self._info("Query:")
-        for line in query.splitlines():
-            self._info("  %s", line)
-        self._info("")
+        self._h3("Query")
+        self._code_block(query, language="sql")
 
         try:
             with connection.cursor() as cursor:
@@ -1173,9 +1219,8 @@ class DatabasePerformanceDiagnostic(Job):
                 )
                 plan_lines = [row[0] for row in cursor.fetchall()]
 
-            self._info("EXPLAIN (ANALYZE, BUFFERS) plan:")
-            for plan_line in plan_lines:
-                self._info("  %s", plan_line)
+            self._h3("EXPLAIN (ANALYZE, BUFFERS) plan")
+            self._code_block(plan_lines)
         except Exception as e:
             self._error("EXPLAIN failed: %s", str(e))
 
@@ -1183,10 +1228,7 @@ class DatabasePerformanceDiagnostic(Job):
     # 10. PostgreSQL settings
     # ------------------------------------------------------------------
     def section_pg_settings(self):
-        self._info("")
-        self._info("=" * 60)
-        self._info("10. POSTGRESQL SETTINGS")
-        self._info("=" * 60)
+        self._h2("10. PostgreSQL Settings")
 
         checks = {
             "work_mem": {
@@ -1203,6 +1245,8 @@ class DatabasePerformanceDiagnostic(Job):
             },
         }
 
+        settings_rows = []
+        warnings_to_emit = []
         with connection.cursor() as cursor:
             for setting_name, check in checks.items():
                 cursor.execute(
@@ -1223,9 +1267,16 @@ class DatabasePerformanceDiagnostic(Job):
                     if "warn_value" in check:
                         is_bad = value == check["warn_value"]
 
+                    flag = "⚠️" if is_bad else ""
+                    settings_rows.append((setting_name, display, check["message"], flag))
                     if is_bad:
-                        self._warning("  %s = %s — %s", setting_name, display, check["message"])
-                    else:
-                        self._info("  %s = %s", setting_name, display)
+                        warnings_to_emit.append(f"{setting_name} = {display} — {check['message']}")
+
+        self._table(
+            ["Setting", "Current value", "What it controls", "Flag"],
+            settings_rows,
+        )
+        for msg in warnings_to_emit:
+            self._warning(msg)
 
 register_jobs(DatabasePerformanceDiagnostic)
