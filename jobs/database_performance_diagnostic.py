@@ -1,15 +1,18 @@
-"""Nautobot Job: Location Performance Diagnostic.
+"""Nautobot Job: Database Performance Diagnostic.
 
-Run this from the Nautobot UI to diagnose 502 errors and slow page loads
-related to locations. No direct database access required.
+Run this from the Nautobot UI to gather facts about database performance,
+query patterns, indexes, and PostgreSQL configuration. Includes location-tree-
+specific diagnostics because tree queries are a known hot path. No direct
+database access required.
 
 Installation:
     1. Place this file in your JOBS_ROOT directory, or in a Git repository
        that Nautobot is configured to pull Jobs from.
     2. Run `nautobot-server post_upgrade` or restart workers to pick up the Job.
-    3. Navigate to Jobs > Location Performance Diagnostic and click Run.
+    3. Navigate to Jobs > Database Performance Diagnostic and click Run.
 """
 
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -23,17 +26,21 @@ from nautobot.dcim.filters import DeviceFilterSet, LocationFilterSet
 from nautobot.dcim.models import Device, Location, Rack
 
 
-class LocationPerformanceDiagnostic(Job):
-    """Diagnose location-related performance issues.
+class DatabasePerformanceDiagnostic(Job):
+    """Diagnose database performance issues in a Nautobot instance.
 
-    Checks tree structure, query timing, missing indexes, and PostgreSQL
-    settings that commonly cause 502 errors at scale.
+    Gathers table sizes, index coverage, query plans, connection state,
+    cumulative PostgreSQL statistics, and configuration values. Includes
+    location-tree-specific checks (sections 2, 3, 5) because tree queries
+    are a known hot path for 502 errors at scale.
     """
 
-    name = "Location Performance Diagnostic"
+    name = "Database Performance Diagnostic"
     description = (
-        "Analyzes the location tree for performance bottlenecks. "
-        "Safe to run in production — all queries are read-only."
+        "Collects diagnostic facts about Nautobot's database: table sizes, indexes, "
+        "query patterns (including location tree queries), PostgreSQL configuration, "
+        "and cumulative query statistics. Produces a downloadable report intended "
+        "for review. Safe to run in production — all queries are read-only."
     )
     custom_filter_params = TextVar(
         description=(
@@ -55,13 +62,24 @@ class LocationPerformanceDiagnostic(Job):
         default=5,
         label="Concurrent Query Count",
     )
+    explain_query = TextVar(
+        description=(
+            "Optional SQL to EXPLAIN (ANALYZE, BUFFERS). Must start with SELECT or WITH "
+            "and contain no DML. Replace pg_stat_statements placeholders ($1, $2, ...) "
+            "with realistic values before pasting."
+        ),
+        required=False,
+        default="",
+        label="Ad-hoc EXPLAIN Query",
+    )
 
     class Meta:
         has_sensitive_variables = False
 
-    def run(self, custom_filter_params="", concurrent_queries=5):
+    def run(self, custom_filter_params="", concurrent_queries=5, explain_query=""):
         self._custom_filter_params = custom_filter_params
         self._concurrent_queries = concurrent_queries
+        self._explain_query = explain_query
         self._lines = []
         self._real_logger = self.logger
 
@@ -73,8 +91,9 @@ class LocationPerformanceDiagnostic(Job):
             ("Concurrent load simulation", self.section_concurrent_load),
             ("Index check", self.section_index_check),
             ("Connection diagnostics", self.section_connection_diagnostics),
+            ("Database statistics", self.section_database_stats),
+            ("Ad-hoc EXPLAIN", self.section_ad_hoc_explain),
             ("PostgreSQL settings", self.section_pg_settings),
-            ("Recommendations", self.section_recommendations),
         ]
         for label, section in sections:
             self._real_logger.info("Running: %s", label)
@@ -82,7 +101,7 @@ class LocationPerformanceDiagnostic(Job):
 
         # Write full report to downloadable file
         content = "\n".join(self._lines)
-        filename = "location_performance_report.txt"
+        filename = "database_performance_report.txt"
         try:
             self.create_file(filename, content)
             self._real_logger.info(
@@ -135,7 +154,7 @@ class LocationPerformanceDiagnostic(Job):
                 f"{location_count:,}",
             )
 
-        # Get actual table size from pg catalog
+        # dcim_location-specific breakdown
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -149,6 +168,38 @@ class LocationPerformanceDiagnostic(Job):
             self._info(
                 "dcim_location disk usage — total: %s, data: %s, indexes: %s",
                 row[0], row[1], row[2],
+            )
+
+        # Top 20 tables by total disk size (database-wide)
+        self._info("")
+        self._info("Top 20 tables by total disk size:")
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    c.relname AS table_name,
+                    pg_size_pretty(pg_total_relation_size(c.oid)) AS total,
+                    pg_size_pretty(pg_relation_size(c.oid)) AS data,
+                    pg_size_pretty(pg_indexes_size(c.oid)) AS indexes,
+                    c.reltuples::bigint AS approx_rows
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.relkind = 'r'
+                  AND n.nspname = 'public'
+                ORDER BY pg_total_relation_size(c.oid) DESC
+                LIMIT 20
+                """
+            )
+            rows = cursor.fetchall()
+
+        self._info(
+            "  %-45s %12s %12s %12s %14s",
+            "Table", "Total", "Data", "Indexes", "Approx rows",
+        )
+        for table_name, total, data, indexes, approx_rows in rows:
+            self._info(
+                "  %-45s %12s %12s %12s %14s",
+                table_name, total, data, indexes, f"{approx_rows:,}",
             )
 
     # ------------------------------------------------------------------
@@ -223,6 +274,37 @@ class LocationPerformanceDiagnostic(Job):
                     name, loc_type, f"{desc_count:,}",
                 )
 
+        # Top 5 parents by direct-child count — impacts dropdown/list rendering
+        self._info("")
+        self._info("Top 5 parents by direct-child count:")
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT parent.name, parent_lt.name AS parent_type, child_count
+                FROM (
+                    SELECT parent_id, count(*) AS child_count
+                    FROM dcim_location
+                    WHERE parent_id IS NOT NULL
+                    GROUP BY parent_id
+                ) counts
+                JOIN dcim_location parent ON counts.parent_id = parent.id
+                JOIN dcim_locationtype parent_lt ON parent.location_type_id = parent_lt.id
+                ORDER BY child_count DESC
+                LIMIT 5
+                """
+            )
+            widest_rows = cursor.fetchall()
+        for p_name, p_type, c_count in widest_rows:
+            self._info(
+                "  %-40s  type=%-15s  direct_children=%s",
+                p_name, p_type, f"{c_count:,}",
+            )
+        if widest_rows and widest_rows[0][2] > 500:
+            self._warning(
+                "Largest parent has %d direct children — parent-selection widgets "
+                "may render slowly.", widest_rows[0][2],
+            )
+
     # ------------------------------------------------------------------
     # 3. Query benchmarks
     # ------------------------------------------------------------------
@@ -256,13 +338,9 @@ class LocationPerformanceDiagnostic(Job):
 
         self._info("  Traversed %s nodes in %.2f seconds", f"{count:,}", elapsed)
         if elapsed > 5:
-            self._warning(
-                "  ** SLOW ** — This CTE runs on EVERY location-filtered page load!"
-            )
+            self._warning("  Execution time exceeds 5s threshold.")
         elif elapsed > 1:
-            self._warning("  Borderline slow — may cause intermittent timeouts under load.")
-        else:
-            self._info("  Acceptable performance.")
+            self._warning("  Execution time exceeds 1s threshold.")
 
         # --- Benchmark B: Subtree of the largest root ---
         self._info("")
@@ -350,12 +428,7 @@ class LocationPerformanceDiagnostic(Job):
             plan = "\n".join(row[0] for row in cursor.fetchall())
 
         if "Seq Scan" in plan:
-            self._warning(
-                "  ** SEQUENTIAL SCAN ** — No trigram index! "
-                "This scans every row on every search."
-            )
-        elif "Bitmap Index Scan" in plan or "Index Scan" in plan:
-            self._info("  Using an index — good.")
+            self._warning("  Plan uses Sequential Scan.")
         self._info("  Query plan: %s", plan.split("\n")[0].strip())
 
         # --- Benchmark D: Device count by location (StatsPanel) ---
@@ -395,9 +468,7 @@ class LocationPerformanceDiagnostic(Job):
                 largest_root.name, f"{count:,}", elapsed,
             )
             if elapsed > 3:
-                self._warning(
-                    "  ** SLOW ** — This runs every time someone views this location's detail page!"
-                )
+                self._warning("  Execution time exceeds 3s threshold.")
 
     # ------------------------------------------------------------------
     # 4. FilterSet benchmarks
@@ -524,9 +595,9 @@ class LocationPerformanceDiagnostic(Job):
                 )
 
                 if combined > 5:
-                    self._warning("    ** SLOW ** — likely causes 502 under load!")
+                    self._warning("    Combined time exceeds 5s threshold.")
                 elif combined > 2:
-                    self._warning("    Borderline — may timeout with concurrent users.")
+                    self._warning("    Combined time exceeds 2s threshold.")
 
                 # Phase 3: EXPLAIN ANALYZE on the count query (usually the bottleneck)
                 if count_ctx.captured_queries:
@@ -545,13 +616,9 @@ class LocationPerformanceDiagnostic(Job):
                     # Flag specific bottleneck patterns
                     plan_text = "\n".join(plan_lines)
                     if "Seq Scan" in plan_text:
-                        self._warning(
-                            "    ** Sequential scan detected — consider adding an index"
-                        )
+                        self._warning("    Plan contains Sequential Scan.")
                     if "Sort Method: external" in plan_text:
-                        self._warning(
-                            "    ** Sort spilled to disk — work_mem is too low for this query"
-                        )
+                        self._warning("    Plan contains external (on-disk) sort.")
                     if "Rows Removed by Filter" in plan_text:
                         for plan_line in plan_lines:
                             if "Rows Removed by Filter" in plan_line:
@@ -632,23 +699,11 @@ class LocationPerformanceDiagnostic(Job):
             )
 
             if max_time > 10:
-                self._warning(
-                    "  ** CRITICAL ** — Slowest query took %.1fs. "
-                    "Under real traffic with %d+ concurrent users, 502s are expected.",
-                    max_time, num_queries,
-                )
+                self._warning("  Max query time %.1fs exceeds 10s threshold.", max_time)
             elif max_time > 5:
-                self._warning(
-                    "  ** SLOW ** — Queries degrade under concurrency. "
-                    "This explains intermittent 502s during peak traffic.",
-                )
+                self._warning("  Max query time %.1fs exceeds 5s threshold.", max_time)
             elif avg_time > 2:
-                self._warning(
-                    "  Elevated average (%.1fs) — may cause issues at higher concurrency.",
-                    avg_time,
-                )
-            else:
-                self._info("  Performance holds under simulated concurrent load.")
+                self._warning("  Average query time %.1fs exceeds 2s threshold.", avg_time)
 
     # ------------------------------------------------------------------
     # 6. Index check
@@ -659,60 +714,76 @@ class LocationPerformanceDiagnostic(Job):
         self._info("6. INDEX CHECK")
         self._info("=" * 60)
 
+        # pg_trgm extension check
         with connection.cursor() as cursor:
-            # Trigram extension
             cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'")
             has_trgm = cursor.fetchone() is not None
 
-            # Trigram indexes
-            cursor.execute(
-                "SELECT indexname FROM pg_indexes "
-                "WHERE tablename = 'dcim_location' AND indexdef LIKE '%%trgm%%'"
-            )
-            location_trgm = cursor.fetchone()
+        if has_trgm:
+            self._info("pg_trgm extension: INSTALLED")
+        else:
+            self._warning("pg_trgm extension: MISSING")
 
+        # Scan all public-schema tables for a 'name' column and check trigram coverage
+        self._info("")
+        self._info("Trigram index coverage on 'name' columns (all Nautobot tables):")
+        with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT indexname FROM pg_indexes "
-                "WHERE tablename = 'dcim_device' AND indexdef LIKE '%%trgm%%'"
+                """
+                SELECT c.table_name, c.data_type,
+                       (SELECT reltuples::bigint FROM pg_class
+                        WHERE relname = c.table_name AND relkind = 'r') AS approx_rows
+                FROM information_schema.columns c
+                WHERE c.table_schema = 'public'
+                  AND c.column_name = 'name'
+                  AND c.data_type IN ('character varying', 'text', 'character')
+                ORDER BY c.table_name
+                """
             )
-            device_trgm = cursor.fetchone()
+            name_tables = cursor.fetchall()
 
-            # Parent index
+        missing_trigram = []
+        with connection.cursor() as cursor:
+            for table_name, _data_type, approx_rows in name_tables:
+                cursor.execute(
+                    "SELECT indexname FROM pg_indexes "
+                    "WHERE tablename = %s AND indexdef LIKE %s",
+                    [table_name, "%trgm%"],
+                )
+                trgm_idx = cursor.fetchone()
+                if trgm_idx:
+                    self._info(
+                        "  %-50s rows=%-12s trigram: %s",
+                        table_name, f"{approx_rows or 0:,}", trgm_idx[0],
+                    )
+                else:
+                    self._info(
+                        "  %-50s rows=%-12s trigram: MISSING",
+                        table_name, f"{approx_rows or 0:,}",
+                    )
+                    if (approx_rows or 0) > 1000:
+                        missing_trigram.append((table_name, approx_rows))
+
+        for table_name, approx_rows in missing_trigram:
+            self._warning(
+                "Table '%s' (~%s rows) has no trigram index on 'name'.",
+                table_name, f"{approx_rows:,}",
+            )
+
+        # Parent ID index check (location-specific — known tree-join hot path)
+        self._info("")
+        self._info("Parent ID indexes on dcim_location:")
+        with connection.cursor() as cursor:
             cursor.execute(
                 "SELECT indexname, indexdef FROM pg_indexes "
                 "WHERE tablename = 'dcim_location' AND indexdef LIKE '%%parent_id%%'"
             )
             parent_indexes = cursor.fetchall()
-
-        # Report
-        if has_trgm:
-            self._info("pg_trgm extension: INSTALLED")
-        else:
-            self._warning("pg_trgm extension: ** MISSING **")
-
-        if location_trgm:
-            self._info("Trigram index on dcim_location.name: EXISTS (%s)", location_trgm[0])
-        else:
-            self._warning(
-                "Trigram index on dcim_location.name: ** MISSING ** — "
-                "all ?q= searches do full table scans!"
-            )
-
-        if device_trgm:
-            self._info("Trigram index on dcim_device.name: EXISTS (%s)", device_trgm[0])
-        else:
-            self._warning(
-                "Trigram index on dcim_device.name: ** MISSING ** — "
-                "device searches do full table scans"
-            )
-
-        self._info("")
-        self._info("Parent ID indexes on dcim_location:")
         if parent_indexes:
-            for name, defn in parent_indexes:
+            for name, _defn in parent_indexes:
                 self._info("  %s", name)
         else:
-            self._warning("  ** NONE ** — tree CTE joins on parent_id with no index!")
+            self._warning("  No parent_id indexes found.")
 
     # ------------------------------------------------------------------
     # 7. Connection & query diagnostics
@@ -754,11 +825,7 @@ class LocationPerformanceDiagnostic(Job):
             "  Usage: %d / %d (%.0f%%)", total_conns, max_conns, usage_pct
         )
         if usage_pct > 80:
-            self._warning(
-                "  ** HIGH ** — %.0f%% of connections in use. "
-                "New requests may queue or be rejected.",
-                usage_pct,
-            )
+            self._warning("  Connection pool utilization %.0f%% exceeds 80%% threshold.", usage_pct)
 
         # Long-running queries
         self._info("")
@@ -787,8 +854,7 @@ class LocationPerformanceDiagnostic(Job):
                     "  PID %s  running %s: %s...", pid, duration, query_preview
                 )
             self._warning(
-                "  Found %d long-running queries — these hold connections and "
-                "can cause 502s by exhausting the worker/connection pool.",
+                "  Found %d queries running longer than 5 seconds.",
                 len(long_queries),
             )
         else:
@@ -814,26 +880,198 @@ class LocationPerformanceDiagnostic(Job):
             self._info("  None found (good).")
 
     # ------------------------------------------------------------------
-    # 8. PostgreSQL settings
+    # 8. Database statistics (cumulative)
+    # ------------------------------------------------------------------
+    def section_database_stats(self):
+        """Cumulative stats — shows what has actually been slow over time."""
+        self._info("")
+        self._info("=" * 60)
+        self._info("8. DATABASE STATISTICS (CUMULATIVE)")
+        self._info("=" * 60)
+
+        # --- pg_stat_statements: top queries by total time ---
+        self._info("")
+        self._info("--- Top queries by cumulative execution time ---")
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements'")
+            has_pgss = cursor.fetchone() is not None
+
+        if not has_pgss:
+            self._info("  pg_stat_statements extension is NOT installed.")
+        else:
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT
+                            round(total_exec_time::numeric, 1) AS total_ms,
+                            calls,
+                            round(mean_exec_time::numeric, 2) AS mean_ms,
+                            round((100.0 * total_exec_time /
+                                NULLIF(sum(total_exec_time) OVER (), 0))::numeric, 1) AS pct,
+                            left(regexp_replace(query, '\\s+', ' ', 'g'), 200) AS query_preview
+                        FROM pg_stat_statements
+                        WHERE query NOT LIKE '%%pg_stat_statements%%'
+                          AND query NOT LIKE '%%EXPLAIN%%'
+                        ORDER BY total_exec_time DESC
+                        LIMIT 10
+                        """
+                    )
+                    rows = cursor.fetchall()
+                self._info("")
+                for idx, (total_ms, calls, mean_ms, pct, preview) in enumerate(rows, 1):
+                    self._info(
+                        "  #%d  total=%sms  calls=%s  avg=%sms  %s%% of DB time",
+                        idx, f"{total_ms:,}", f"{calls:,}", mean_ms, pct,
+                    )
+                    self._info("      %s", preview)
+            except Exception as e:
+                self._warning("  Could not query pg_stat_statements: %s", str(e))
+
+        # --- Sequential scans vs index scans per table ---
+        self._info("")
+        self._info("--- Sequential scans vs index scans (tables with >1K rows) ---")
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    relname,
+                    seq_scan,
+                    COALESCE(idx_scan, 0) AS idx_scan,
+                    n_live_tup,
+                    CASE WHEN seq_scan + COALESCE(idx_scan, 0) = 0 THEN 0
+                         ELSE round(100.0 * seq_scan / (seq_scan + COALESCE(idx_scan, 0)), 1)
+                    END AS seq_pct
+                FROM pg_stat_user_tables
+                WHERE schemaname = 'public'
+                  AND n_live_tup > 1000
+                  AND (seq_scan + COALESCE(idx_scan, 0)) > 0
+                ORDER BY (seq_scan::bigint * n_live_tup) DESC
+                LIMIT 15
+                """
+            )
+            scan_rows = cursor.fetchall()
+
+        self._info(
+            "  %-42s %12s %12s %12s %7s",
+            "Table", "Seq scans", "Idx scans", "Rows", "Seq %",
+        )
+        for relname, seq, idx, n_rows, seq_pct in scan_rows:
+            self._info(
+                "  %-42s %12s %12s %12s %6s%%",
+                relname, f"{seq:,}", f"{idx:,}", f"{n_rows:,}", seq_pct,
+            )
+        # Flag tables doing heavy sequential scanning
+        for relname, seq, idx, n_rows, seq_pct in scan_rows:
+            if seq_pct > 50 and n_rows > 10000 and seq > 100:
+                self._warning(
+                    "%s: %s%% sequential scans on %s rows (%s scans total).",
+                    relname, seq_pct, f"{n_rows:,}", f"{seq:,}",
+                )
+
+        # --- Buffer cache hit ratio ---
+        self._info("")
+        self._info("--- Buffer cache hit ratio ---")
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    COALESCE(sum(heap_blks_read), 0) AS disk_reads,
+                    COALESCE(sum(heap_blks_hit), 0) AS cache_hits,
+                    CASE WHEN COALESCE(sum(heap_blks_hit), 0) + COALESCE(sum(heap_blks_read), 0) = 0
+                         THEN 0
+                         ELSE round(100.0 * sum(heap_blks_hit) /
+                              (sum(heap_blks_hit) + sum(heap_blks_read)), 2)
+                    END AS hit_ratio
+                FROM pg_statio_user_tables
+                """
+            )
+            row = cursor.fetchone()
+
+        if row:
+            disk, hits, ratio = row
+            self._info(
+                "  Disk reads: %s  |  Cache hits: %s  |  Hit ratio: %s%%",
+                f"{disk:,}", f"{hits:,}", ratio,
+            )
+            if ratio and ratio < 99:
+                self._warning("Cache hit ratio %s%% below 99%% threshold.", ratio)
+
+    # ------------------------------------------------------------------
+    # 9. Ad-hoc EXPLAIN ANALYZE
+    # ------------------------------------------------------------------
+    def section_ad_hoc_explain(self):
+        """Run EXPLAIN (ANALYZE, BUFFERS) on a user-provided query."""
+        query = (self._explain_query or "").strip().rstrip(";").strip()
+        if not query:
+            return  # Skip section entirely if no query provided
+
+        self._info("")
+        self._info("=" * 60)
+        self._info("9. AD-HOC EXPLAIN ANALYZE")
+        self._info("=" * 60)
+        self._info("")
+
+        # Safety: only allow read-only queries
+        first_token = query.split(None, 1)[0].upper() if query else ""
+        if first_token not in ("SELECT", "WITH"):
+            self._warning(
+                "Query rejected: must start with SELECT or WITH. First token: %s",
+                first_token,
+            )
+            return
+
+        # Reject queries containing DML / DDL keywords
+        forbidden = (
+            "INSERT", "UPDATE", "DELETE", "TRUNCATE", "DROP", "ALTER",
+            "CREATE", "GRANT", "REVOKE", "COPY", "VACUUM", "REINDEX",
+        )
+        for kw in forbidden:
+            if re.search(r"\b" + kw + r"\b", query, flags=re.IGNORECASE):
+                self._warning(
+                    "Query rejected: contains forbidden keyword '%s'.", kw,
+                )
+                return
+
+        self._info("Query:")
+        for line in query.splitlines():
+            self._info("  %s", line)
+        self._info("")
+
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) {query}"  # noqa: S608
+                )
+                plan_lines = [row[0] for row in cursor.fetchall()]
+
+            self._info("EXPLAIN (ANALYZE, BUFFERS) plan:")
+            for plan_line in plan_lines:
+                self._info("  %s", plan_line)
+        except Exception as e:
+            self._error("EXPLAIN failed: %s", str(e))
+
+    # ------------------------------------------------------------------
+    # 10. PostgreSQL settings
     # ------------------------------------------------------------------
     def section_pg_settings(self):
         self._info("")
         self._info("=" * 60)
-        self._info("8. POSTGRESQL SETTINGS")
+        self._info("10. POSTGRESQL SETTINGS")
         self._info("=" * 60)
 
         checks = {
             "work_mem": {
                 "warn_below_kb": 65536,  # 64MB
-                "message": "Low work_mem forces CTE intermediate results to disk. Recommend 256MB.",
+                "message": "Low work_mem forces sort/hash/CTE intermediate results to spill to disk.",
             },
             "statement_timeout": {
                 "warn_value": "0",
-                "message": "No statement timeout — queries run until the proxy 502s. Set to 15s.",
+                "message": "No statement timeout — long-running queries will run until the reverse proxy times out and returns a 502.",
             },
             "shared_buffers": {
                 "warn_below_kb": 524288,  # 512MB
-                "message": "Low shared_buffers. Recommend 25%% of system RAM.",
+                "message": "Low shared_buffers — less data cached in PostgreSQL memory, causing more disk reads.",
             },
         }
 
@@ -862,48 +1100,4 @@ class LocationPerformanceDiagnostic(Job):
                     else:
                         self._info("  %s = %s", setting_name, display)
 
-    # ------------------------------------------------------------------
-    # 9. Recommendations
-    # ------------------------------------------------------------------
-    def section_recommendations(self):
-        self._info("")
-        self._info("=" * 60)
-        self._info("9. RECOMMENDATIONS")
-        self._info("=" * 60)
-        self._info("")
-        self._info("--- Missing indexes ---")
-        self._info("If trigram indexes are missing, a database administrator should run:")
-        self._info("  CREATE EXTENSION IF NOT EXISTS pg_trgm;")
-        self._info(
-            "  CREATE INDEX CONCURRENTLY idx_dcim_location_name_trgm"
-        )
-        self._info("      ON dcim_location USING gin (name gin_trgm_ops);")
-        self._info(
-            "  CREATE INDEX CONCURRENTLY idx_dcim_device_name_trgm"
-        )
-        self._info("      ON dcim_device USING gin (name gin_trgm_ops);")
-        self._info("")
-        self._info("--- PostgreSQL tuning ---")
-        self._info("If work_mem is low:")
-        self._info("  ALTER DATABASE nautobot SET work_mem = '256MB';")
-        self._info("")
-        self._info("If statement_timeout is unlimited:")
-        self._info("  ALTER ROLE nautobot SET statement_timeout = '15s';")
-        self._info("")
-        self._info("--- Concurrent load / connection issues ---")
-        self._info("If queries degrade under concurrent load:")
-        self._info("  - Ensure connection pooling (PgBouncer) is configured")
-        self._info("  - Reduce Nautobot worker count if DB CPU is saturated")
-        self._info("  - Consider increasing shared_buffers (25%% of system RAM)")
-        self._info("")
-        self._info("If connection usage is high:")
-        self._info("  - Check for connection leaks (idle connections that never close)")
-        self._info("  - Lower CONN_MAX_AGE in Django settings or configure PgBouncer")
-        self._info("")
-        self._info("--- Nautobot Cloud ---")
-        self._info("For Nautobot Cloud instances, share this job's full output with")
-        self._info("the Cloud support team — they manage PostgreSQL settings and can")
-        self._info("apply index and tuning changes on your behalf.")
-
-
-register_jobs(LocationPerformanceDiagnostic)
+register_jobs(DatabasePerformanceDiagnostic)
