@@ -85,10 +85,7 @@ class DatabasePerformanceDiagnostic(Job):
 
         self._lines.append("# Database Performance Diagnostic Report")
         self._lines.append("")
-        self._lines.append(
-            "This report is intended for review by a domain expert or LLM. "
-            "All queries are read-only."
-        )
+        self._lines.append("All queries are read-only.")
 
         sections = [
             ("Table sizes", self.section_table_sizes),
@@ -1231,24 +1228,14 @@ class DatabasePerformanceDiagnostic(Job):
         self._h2("10. PostgreSQL Settings")
 
         checks = {
-            "work_mem": {
-                "warn_below_kb": 65536,  # 64MB
-                "message": "Low work_mem forces sort/hash/CTE intermediate results to spill to disk.",
-            },
-            "statement_timeout": {
-                "warn_value": "0",
-                "message": "No statement timeout — long-running queries will run until the reverse proxy times out and returns a 502.",
-            },
-            "shared_buffers": {
-                "warn_below_kb": 524288,  # 512MB
-                "message": "Low shared_buffers — less data cached in PostgreSQL memory, causing more disk reads.",
-            },
+            "work_mem": "Memory used per sort/hash/CTE operation before spilling to disk.",
+            "statement_timeout": "Maximum time a query can run before being cancelled (0 = unlimited).",
+            "shared_buffers": "Amount of memory PostgreSQL uses for caching table and index data.",
         }
 
         settings_rows = []
-        warnings_to_emit = []
         with connection.cursor() as cursor:
-            for setting_name, check in checks.items():
+            for setting_name, description in checks.items():
                 cursor.execute(
                     "SELECT setting, unit FROM pg_settings WHERE name = %s",
                     [setting_name],
@@ -1257,26 +1244,11 @@ class DatabasePerformanceDiagnostic(Job):
                 if row:
                     value, unit = row
                     display = f"{value} {unit}" if unit else value
-
-                    is_bad = False
-                    if "warn_below_kb" in check:
-                        try:
-                            is_bad = int(value) < check["warn_below_kb"]
-                        except ValueError:
-                            pass
-                    if "warn_value" in check:
-                        is_bad = value == check["warn_value"]
-
-                    flag = "⚠️" if is_bad else ""
-                    settings_rows.append((setting_name, display, check["message"], flag))
-                    if is_bad:
-                        warnings_to_emit.append(f"{setting_name} = {display} — {check['message']}")
+                    settings_rows.append((setting_name, display, description))
 
         self._table(
-            ["Setting", "Current value", "What it controls", "Flag"],
+            ["Setting", "Current value", "What it controls"],
             settings_rows,
         )
-        for msg in warnings_to_emit:
-            self._warning(msg)
 
 register_jobs(DatabasePerformanceDiagnostic)
