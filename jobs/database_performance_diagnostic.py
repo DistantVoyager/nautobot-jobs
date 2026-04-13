@@ -40,7 +40,7 @@ class DatabasePerformanceDiagnostic(Job):
         "Collects diagnostic facts about Nautobot's database: table sizes, indexes, "
         "query patterns (including location tree queries), PostgreSQL configuration, "
         "and cumulative query statistics. Produces a downloadable report intended "
-        "for review. Safe to run in production — all queries are read-only."
+        "for review."
     )
     custom_filter_params = TextVar(
         description=(
