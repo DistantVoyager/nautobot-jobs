@@ -15,8 +15,10 @@ Installation:
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 
 from django.db import connection
+from django.db.utils import OperationalError
 
 from django.http import QueryDict
 from django.test.utils import CaptureQueriesContext
@@ -62,6 +64,15 @@ class DatabasePerformanceDiagnostic(Job):
         default=5,
         label="Concurrent Query Count",
     )
+    statement_timeout_seconds = IntegerVar(
+        description=(
+            "Per-query PostgreSQL statement_timeout (seconds). Applied to this job's "
+            "DB session(s) so any single query is capped. 0 disables."
+        ),
+        required=False,
+        default=60,
+        label="Statement Timeout (seconds)",
+    )
     explain_query = TextVar(
         description=(
             "Optional SQL to EXPLAIN (ANALYZE, BUFFERS). Must start with SELECT or WITH "
@@ -76,16 +87,31 @@ class DatabasePerformanceDiagnostic(Job):
     class Meta:
         has_sensitive_variables = False
 
-    def run(self, custom_filter_params="", concurrent_queries=5, explain_query=""):
+    def run(self, custom_filter_params="", concurrent_queries=5, explain_query="",
+            statement_timeout_seconds=60):
         self._custom_filter_params = custom_filter_params
         self._concurrent_queries = concurrent_queries
         self._explain_query = explain_query
+        self._statement_timeout_seconds = statement_timeout_seconds
         self._lines = []
         self._real_logger = self.logger
 
         self._lines.append("# Database Performance Diagnostic Report")
         self._lines.append("")
         self._lines.append("All queries are read-only.")
+        if statement_timeout_seconds > 0:
+            self._lines.append(
+                f"Per-query timeout: **{statement_timeout_seconds}s** "
+                "(applied via PostgreSQL `statement_timeout`)."
+            )
+
+        # Apply session-level guards so a pathological query can't run unbounded,
+        # and tag the session so a DBA watching pg_stat_activity can identify this job.
+        timeout_ms = int(statement_timeout_seconds) * 1000
+        with connection.cursor() as cursor:
+            if timeout_ms > 0:
+                cursor.execute("SET statement_timeout = %s", [timeout_ms])
+            cursor.execute("SET application_name = %s", ["nautobot-perf-diag"])
 
         sections = [
             ("Table sizes", self.section_table_sizes),
@@ -99,9 +125,14 @@ class DatabasePerformanceDiagnostic(Job):
             ("Ad-hoc EXPLAIN", self.section_ad_hoc_explain),
             ("PostgreSQL settings", self.section_pg_settings),
         ]
-        for label, section in sections:
-            self._real_logger.info("Running: %s", label)
-            section()
+        try:
+            for label, section in sections:
+                self._real_logger.info("Running: %s", label)
+                section()
+        finally:
+            with connection.cursor() as cursor:
+                cursor.execute("RESET statement_timeout")
+                cursor.execute("RESET application_name")
 
         # Write full report to downloadable file
         content = "\n".join(self._lines)
@@ -118,6 +149,28 @@ class DatabasePerformanceDiagnostic(Job):
             )
             for line in self._lines:
                 self._real_logger.info(line)
+
+    # ------------------------------------------------------------------
+    # Timeout handling helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_timeout(exc):
+        """True if exc is a PostgreSQL statement_timeout cancellation."""
+        return isinstance(exc, OperationalError) and "statement timeout" in str(exc).lower()
+
+    @contextmanager
+    def _timeout_guard(self, label):
+        """Swallow statement_timeout as a warning; let other errors propagate."""
+        try:
+            yield
+        except OperationalError as exc:
+            if self._is_timeout(exc):
+                self._warning(
+                    "%s exceeded %ds statement_timeout — skipped.",
+                    label, self._statement_timeout_seconds,
+                )
+            else:
+                raise
 
     # ------------------------------------------------------------------
     # Output helpers — write to buffer; warnings/errors also go to log
@@ -343,56 +396,58 @@ class DatabasePerformanceDiagnostic(Job):
         self._h3("A) Full tree recursive CTE")
         self._info("_This is what `TreeNodeMultipleChoiceFilter` triggers on any location-filtered page._")
 
-        with connection.cursor() as cursor:
-            start = time.perf_counter()
-            cursor.execute(
-                """
-                WITH RECURSIVE __tree AS (
-                    SELECT id, parent_id, 0 AS tree_depth
-                    FROM dcim_location WHERE parent_id IS NULL
-                    UNION ALL
-                    SELECT t.id, t.parent_id, __tree.tree_depth + 1
-                    FROM dcim_location t
-                    INNER JOIN __tree ON t.parent_id = __tree.id
+        with self._timeout_guard("Benchmark A (full tree CTE)"):
+            with connection.cursor() as cursor:
+                start = time.perf_counter()
+                cursor.execute(
+                    """
+                    WITH RECURSIVE __tree AS (
+                        SELECT id, parent_id, 0 AS tree_depth
+                        FROM dcim_location WHERE parent_id IS NULL
+                        UNION ALL
+                        SELECT t.id, t.parent_id, __tree.tree_depth + 1
+                        FROM dcim_location t
+                        INNER JOIN __tree ON t.parent_id = __tree.id
+                    )
+                    SELECT count(*) FROM __tree
+                    """
                 )
-                SELECT count(*) FROM __tree
-                """
-            )
-            elapsed = time.perf_counter() - start
-            count = cursor.fetchone()[0]
+                elapsed = time.perf_counter() - start
+                count = cursor.fetchone()[0]
 
-        self._info(f"Traversed **{count:,}** nodes in **{elapsed:.2f}s**.")
-        if elapsed > 5:
-            self._warning("Execution time exceeds 5s threshold.")
-        elif elapsed > 1:
-            self._warning("Execution time exceeds 1s threshold.")
+            self._info(f"Traversed **{count:,}** nodes in **{elapsed:.2f}s**.")
+            if elapsed > 5:
+                self._warning("Execution time exceeds 5s threshold.")
+            elif elapsed > 1:
+                self._warning("Execution time exceeds 1s threshold.")
 
         # --- Benchmark B: Subtree of the largest root (reused from section 2) ---
         self._h3("B) Subtree lookup for the largest root")
 
         largest_root = self._largest_root
         if largest_root:
-            with connection.cursor() as cursor:
-                start = time.perf_counter()
-                cursor.execute(
-                    """
-                    WITH RECURSIVE __tree AS (
-                        SELECT id FROM dcim_location WHERE id = %s
-                        UNION ALL
-                        SELECT t.id
-                        FROM dcim_location t
-                        INNER JOIN __tree ON t.parent_id = __tree.id
+            with self._timeout_guard("Benchmark B (largest-root subtree)"):
+                with connection.cursor() as cursor:
+                    start = time.perf_counter()
+                    cursor.execute(
+                        """
+                        WITH RECURSIVE __tree AS (
+                            SELECT id FROM dcim_location WHERE id = %s
+                            UNION ALL
+                            SELECT t.id
+                            FROM dcim_location t
+                            INNER JOIN __tree ON t.parent_id = __tree.id
+                        )
+                        SELECT count(*) FROM __tree
+                        """,
+                        [str(largest_root.pk)],
                     )
-                    SELECT count(*) FROM __tree
-                    """,
-                    [str(largest_root.pk)],
-                )
-                elapsed = time.perf_counter() - start
-                count = cursor.fetchone()[0]
+                    elapsed = time.perf_counter() - start
+                    count = cursor.fetchone()[0]
 
-            self._info(
-                f'Root `{largest_root.name}` — **{count:,}** descendants in **{elapsed:.2f}s**.'
-            )
+                self._info(
+                    f'Root `{largest_root.name}` — **{count:,}** descendants in **{elapsed:.2f}s**.'
+                )
         else:
             self._info("_No root locations found._")
 
@@ -405,67 +460,69 @@ class DatabasePerformanceDiagnostic(Job):
         else:
             search_term = "DC"
 
-        with connection.cursor() as cursor:
-            start = time.perf_counter()
-            cursor.execute(
-                "SELECT count(*) FROM dcim_location WHERE name ILIKE %s",
-                [f"%{search_term}%"],
+        with self._timeout_guard("Benchmark C (ILIKE search)"):
+            with connection.cursor() as cursor:
+                start = time.perf_counter()
+                cursor.execute(
+                    "SELECT count(*) FROM dcim_location WHERE name ILIKE %s",
+                    [f"%{search_term}%"],
+                )
+                elapsed = time.perf_counter() - start
+                count = cursor.fetchone()[0]
+
+            self._info(
+                f'Search for `%{search_term}%` — **{count:,}** matches in **{elapsed:.2f}s**.'
             )
-            elapsed = time.perf_counter() - start
-            count = cursor.fetchone()[0]
 
-        self._info(
-            f'Search for `%{search_term}%` — **{count:,}** matches in **{elapsed:.2f}s**.'
-        )
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "EXPLAIN (FORMAT TEXT) SELECT count(*) FROM dcim_location WHERE name ILIKE %s",
+                    [f"%{search_term}%"],
+                )
+                plan_lines = [row[0] for row in cursor.fetchall()]
+                plan = "\n".join(plan_lines)
 
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "EXPLAIN (FORMAT TEXT) SELECT count(*) FROM dcim_location WHERE name ILIKE %s",
-                [f"%{search_term}%"],
-            )
-            plan_lines = [row[0] for row in cursor.fetchall()]
-            plan = "\n".join(plan_lines)
-
-        self._info("**Query plan:**")
-        self._code_block(plan_lines)
-        if "Seq Scan" in plan:
-            self._warning("Plan uses Sequential Scan.")
+            self._info("**Query plan:**")
+            self._code_block(plan_lines)
+            if "Seq Scan" in plan:
+                self._warning("Plan uses Sequential Scan.")
 
         # --- Benchmark D: Device count by location (StatsPanel) ---
         self._h3("D) Device count for a location (StatsPanel)")
 
         if largest_root:
-            start = time.perf_counter()
-            device_count = Device.objects.filter(location=largest_root).count()
-            elapsed_direct = time.perf_counter() - start
-
-            with connection.cursor() as cursor:
+            with self._timeout_guard("Benchmark D (device count w/ descendants)"):
                 start = time.perf_counter()
-                cursor.execute(
-                    """
-                    WITH RECURSIVE __tree AS (
-                        SELECT id FROM dcim_location WHERE id = %s
-                        UNION ALL
-                        SELECT t.id FROM dcim_location t
-                        INNER JOIN __tree ON t.parent_id = __tree.id
-                    )
-                    SELECT count(*) FROM dcim_device
-                    WHERE location_id IN (SELECT id FROM __tree)
-                    """,
-                    [str(largest_root.pk)],
-                )
-                elapsed_with_desc = time.perf_counter() - start
-                count = cursor.fetchone()[0]
+                device_count = Device.objects.filter(location=largest_root).count()
+                elapsed_direct = time.perf_counter() - start
 
-            self._table(
-                ["Query", "Result", "Time"],
-                [
-                    (f"Direct at `{largest_root.name}`", f"{device_count:,} devices", f"{elapsed_direct:.2f}s"),
-                    (f"`{largest_root.name}` + descendants", f"{count:,} devices", f"{elapsed_with_desc:.2f}s"),
-                ],
-            )
-            if elapsed_with_desc > 3:
-                self._warning("Descendant query exceeds 3s threshold.")
+                with connection.cursor() as cursor:
+                    start = time.perf_counter()
+                    cursor.execute(
+                        """
+                        WITH RECURSIVE __tree AS (
+                            SELECT id FROM dcim_location WHERE id = %s
+                            UNION ALL
+                            SELECT t.id FROM dcim_location t
+                            INNER JOIN __tree ON t.parent_id = __tree.id
+                        )
+                        SELECT count(*) FROM dcim_device
+                        WHERE location_id IN (SELECT id FROM __tree)
+                        """,
+                        [str(largest_root.pk)],
+                    )
+                    elapsed_with_desc = time.perf_counter() - start
+                    count = cursor.fetchone()[0]
+
+                self._table(
+                    ["Query", "Result", "Time"],
+                    [
+                        (f"Direct at `{largest_root.name}`", f"{device_count:,} devices", f"{elapsed_direct:.2f}s"),
+                        (f"`{largest_root.name}` + descendants", f"{count:,} devices", f"{elapsed_with_desc:.2f}s"),
+                    ],
+                )
+                if elapsed_with_desc > 3:
+                    self._warning("Descendant query exceeds 3s threshold.")
 
     # ------------------------------------------------------------------
     # 4. FilterSet benchmarks
@@ -603,6 +660,15 @@ class DatabasePerformanceDiagnostic(Job):
                                 "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) %s" % sql  # noqa: S608
                             )
                             plan_lines = [row[0] for row in cursor.fetchall()]
+                    except OperationalError as plan_err:
+                        if self._is_timeout(plan_err):
+                            self._warning(
+                                "EXPLAIN ANALYZE for %s exceeded %ds statement_timeout.",
+                                phase_label, self._statement_timeout_seconds,
+                            )
+                        else:
+                            self._warning("EXPLAIN failed for %s: %s", phase_label, str(plan_err))
+                        continue
                     except Exception as plan_err:
                         self._warning("EXPLAIN failed for %s: %s", phase_label, str(plan_err))
                         continue
@@ -623,6 +689,14 @@ class DatabasePerformanceDiagnostic(Job):
                         if "Rows Removed by Filter" in plan_line:
                             self._info(f"- _{plan_line.strip()}_")
 
+            except OperationalError as e:
+                if self._is_timeout(e):
+                    self._warning(
+                        "Scenario %d (%s) exceeded %ds statement_timeout.",
+                        idx, scenario, self._statement_timeout_seconds,
+                    )
+                else:
+                    self._error("Scenario %d (%s) failed: %s", idx, scenario, str(e))
             except Exception as e:
                 self._error("Scenario %d (%s) failed: %s", idx, scenario, str(e))
 
@@ -653,11 +727,18 @@ class DatabasePerformanceDiagnostic(Job):
             SELECT count(*) FROM __tree
         """
 
+        timeout_ms = int(self._statement_timeout_seconds) * 1000
+
         def _run_cte():
             from django.db import connection as thread_conn
 
             try:
                 with thread_conn.cursor() as cursor:
+                    # Each thread opens its own connection — apply the same guards
+                    # as the main session so a runaway CTE can't block indefinitely.
+                    if timeout_ms > 0:
+                        cursor.execute("SET statement_timeout = %s", [timeout_ms])
+                    cursor.execute("SET application_name = %s", ["nautobot-perf-diag"])
                     start = time.perf_counter()
                     cursor.execute(cte_sql)
                     cursor.fetchone()
@@ -666,15 +747,27 @@ class DatabasePerformanceDiagnostic(Job):
                 thread_conn.close()
 
         wall_start = time.perf_counter()
+        timeouts = 0
         with ThreadPoolExecutor(max_workers=num_queries) as pool:
             futures = [pool.submit(_run_cte) for _ in range(num_queries)]
             times = []
             for future in as_completed(futures):
                 try:
                     times.append(future.result())
+                except OperationalError as e:
+                    if self._is_timeout(e):
+                        timeouts += 1
+                    else:
+                        self._error("  Query failed: %s", str(e))
                 except Exception as e:
                     self._error("  Query failed: %s", str(e))
         wall_elapsed = time.perf_counter() - wall_start
+
+        if timeouts:
+            self._warning(
+                "%d of %d concurrent queries hit the %ds statement_timeout.",
+                timeouts, num_queries, self._statement_timeout_seconds,
+            )
 
         if times:
             avg_time = sum(times) / len(times)
@@ -682,17 +775,17 @@ class DatabasePerformanceDiagnostic(Job):
             min_time = min(times)
             throughput = len(times) / wall_elapsed if wall_elapsed > 0 else 0
 
-            self._table(
-                ["Metric", "Value"],
-                [
-                    ("Completed", f"{len(times)} / {num_queries}"),
-                    ("Wall clock", f"{wall_elapsed:.2f}s"),
-                    ("Per-query min", f"{min_time:.2f}s"),
-                    ("Per-query avg", f"{avg_time:.2f}s"),
-                    ("Per-query max", f"{max_time:.2f}s"),
-                    ("Throughput", f"{throughput:.1f} queries/sec"),
-                ],
-            )
+            summary_rows = [
+                ("Completed", f"{len(times)} / {num_queries}"),
+                ("Wall clock", f"{wall_elapsed:.2f}s"),
+                ("Per-query min", f"{min_time:.2f}s"),
+                ("Per-query avg", f"{avg_time:.2f}s"),
+                ("Per-query max", f"{max_time:.2f}s"),
+                ("Throughput", f"{throughput:.1f} queries/sec"),
+            ]
+            if timeouts:
+                summary_rows.insert(1, ("Timed out", f"{timeouts}"))
+            self._table(["Metric", "Value"], summary_rows)
 
             if max_time > 10:
                 self._warning("Max query time %.1fs exceeds 10s threshold.", max_time)
@@ -1218,6 +1311,14 @@ class DatabasePerformanceDiagnostic(Job):
 
             self._h3("EXPLAIN (ANALYZE, BUFFERS) plan")
             self._code_block(plan_lines)
+        except OperationalError as e:
+            if self._is_timeout(e):
+                self._warning(
+                    "Ad-hoc query exceeded %ds statement_timeout.",
+                    self._statement_timeout_seconds,
+                )
+            else:
+                self._error("EXPLAIN failed: %s", str(e))
         except Exception as e:
             self._error("EXPLAIN failed: %s", str(e))
 
