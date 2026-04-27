@@ -59,9 +59,12 @@ class DatabasePerformanceDiagnostic(Job):
         label="Custom Filter Parameters",
     )
     concurrent_queries = IntegerVar(
-        description="Number of parallel tree CTE queries for concurrent load simulation (1-20).",
+        description=(
+            "Number of parallel tree CTE queries for concurrent load simulation (1-20). "
+            "This is the only section that adds DB load — keep low for the first run."
+        ),
         required=False,
-        default=5,
+        default=2,
         label="Concurrent Query Count",
     )
     statement_timeout_seconds = IntegerVar(
@@ -87,7 +90,7 @@ class DatabasePerformanceDiagnostic(Job):
     class Meta:
         has_sensitive_variables = False
 
-    def run(self, custom_filter_params="", concurrent_queries=5, explain_query="",
+    def run(self, custom_filter_params="", concurrent_queries=2, explain_query="",
             statement_timeout_seconds=60):
         self._custom_filter_params = custom_filter_params
         self._concurrent_queries = concurrent_queries
@@ -104,6 +107,20 @@ class DatabasePerformanceDiagnostic(Job):
                 f"Per-query timeout: **{statement_timeout_seconds}s** "
                 "(applied via PostgreSQL `statement_timeout`)."
             )
+        self._lines.append("")
+        self._lines.append(
+            "**To identify and cancel this job from PostgreSQL** (e.g. if it becomes disruptive):"
+        )
+        self._lines.append("")
+        self._code_block(
+            "SELECT pid, application_name, state, query\n"
+            "FROM pg_stat_activity\n"
+            "WHERE application_name LIKE 'nautobot-perf-diag%';\n"
+            "\n"
+            "SELECT pg_cancel_backend(<pid>);   -- soft cancel\n"
+            "SELECT pg_terminate_backend(<pid>);  -- if cancel doesn't take",
+            language="sql",
+        )
 
         # Apply session-level guards so a pathological query can't run unbounded,
         # and tag the session so a DBA watching pg_stat_activity can identify this job.
@@ -579,13 +596,19 @@ class DatabasePerformanceDiagnostic(Job):
                 DeviceFilterSet, f"location={largest_root.pk}",
             ))
 
-        # Custom filter params from user input
+        # Custom filter params from user input — cap at MAX_CUSTOM_SCENARIOS so a long
+        # paste can't blow the runtime up (each scenario does a count + page + 2 EXPLAIN ANALYZE).
+        MAX_CUSTOM_SCENARIOS = 10
         custom_params = self._custom_filter_params
         if custom_params:
-            for line in custom_params.strip().splitlines():
-                line = line.strip()
-                if not line:
-                    continue
+            raw_lines = [ln.strip() for ln in custom_params.strip().splitlines() if ln.strip()]
+            if len(raw_lines) > MAX_CUSTOM_SCENARIOS:
+                self._warning(
+                    "Received %d custom filter lines; only the first %d will be benchmarked.",
+                    len(raw_lines), MAX_CUSTOM_SCENARIOS,
+                )
+                raw_lines = raw_lines[:MAX_CUSTOM_SCENARIOS]
+            for line in raw_lines:
                 if line.lower().startswith("devices:"):
                     fs_class = DeviceFilterSet
                     query_str = line.split(":", 1)[1]
@@ -729,16 +752,20 @@ class DatabasePerformanceDiagnostic(Job):
 
         timeout_ms = int(self._statement_timeout_seconds) * 1000
 
-        def _run_cte():
+        def _run_cte(worker_idx):
             from django.db import connection as thread_conn
 
             try:
                 with thread_conn.cursor() as cursor:
                     # Each thread opens its own connection — apply the same guards
-                    # as the main session so a runaway CTE can't block indefinitely.
+                    # as the main session, with a per-worker app_name so a DBA can
+                    # identify and cancel an individual concurrent backend.
                     if timeout_ms > 0:
                         cursor.execute("SET statement_timeout = %s", [timeout_ms])
-                    cursor.execute("SET application_name = %s", ["nautobot-perf-diag"])
+                    cursor.execute(
+                        "SET application_name = %s",
+                        [f"nautobot-perf-diag:concurrent-{worker_idx}"],
+                    )
                     start = time.perf_counter()
                     cursor.execute(cte_sql)
                     cursor.fetchone()
@@ -749,7 +776,7 @@ class DatabasePerformanceDiagnostic(Job):
         wall_start = time.perf_counter()
         timeouts = 0
         with ThreadPoolExecutor(max_workers=num_queries) as pool:
-            futures = [pool.submit(_run_cte) for _ in range(num_queries)]
+            futures = [pool.submit(_run_cte, i) for i in range(num_queries)]
             times = []
             for future in as_completed(futures):
                 try:
@@ -1173,7 +1200,7 @@ class DatabasePerformanceDiagnostic(Job):
                             round(mean_exec_time::numeric, 2) AS mean_ms,
                             round((100.0 * total_exec_time /
                                 NULLIF(sum(total_exec_time) OVER (), 0))::numeric, 1) AS pct,
-                            regexp_replace(query, '\\s+', ' ', 'g') AS query_text
+                            left(regexp_replace(query, '\\s+', ' ', 'g'), 2000) AS query_text
                         FROM pg_stat_statements
                         WHERE query NOT LIKE '%%pg_stat_statements%%'
                           AND query NOT LIKE '%%EXPLAIN%%'
