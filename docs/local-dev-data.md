@@ -3,9 +3,34 @@
 For a local dev instance **without design-builder**, use the NDG **Postgres SQL**
 artifact (`-P-`) and then run `migrate`. Tested working; see below.
 
+The script downloads the dataset, restores it, and migrates. It autodetects the
+container names, and prompts before destroying anything:
+
 ```bash
-./scripts/load-ndg-dataset.sh <nautobot-container> <db-container> 3.1.4 S
+./scripts/load-ndg-dataset.sh
 ```
+
+```bash
+./scripts/load-ndg-dataset.sh --version 3.1.4 --size S
+```
+
+See what datasets exist:
+
+```bash
+./scripts/load-ndg-dataset.sh --list
+```
+
+Autodetection errors out rather than guessing when several Nautobot or database
+containers are up — pass `-n`/`-d` explicitly then, since picking the wrong container
+destroys the wrong database:
+
+```bash
+./scripts/load-ndg-dataset.sh -n my-nautobot-1 -d my-db-1
+```
+
+`--help` lists the rest (`--db-user`, `--db-name`, `--yes` to skip the prompt).
+Downloads are cached per version+size under `~/.cache/ndg-data/`; note the `L` datasets
+are ~290 MB uncompressed.
 
 Result on a Nautobot 3.2.0 dev stack (PostgreSQL 17 restoring a PG 15 dump):
 
@@ -67,9 +92,14 @@ The dump carries its own accounts, so create your own superuser to log in.
 
 - **FORMAT**: `P` = Postgres SQL (use this), `T` = Postgres tar for `pg_restore`,
   `M` = MySQL, `J`/`I` = dumpdata JSON (**broken**, see below)
-- **SIZE**: `S` = small (the ~330-device set above), `L` = large (80 branches)
+- **SIZE**: `S` = small (the ~330-device set above), `L` = large (80 branches, ~290 MB)
 - **VERSION**: `3.0.0`, `3.0.6`, `3.1.4`, `develop`, `next`. Pick the closest at or
   below your instance's version — migrations only run forward.
+
+Not every version+size combination is built, and they are spread across NDG's
+per-branch release tags (`3.1.4-P-L` exists only on the main tag; `3.0.6` has no `S`
+build at all). The script searches both known tags, so `--list` is the authority on
+what you can actually get.
 
 ## Why not the JSON (`-J-`) artifacts
 
