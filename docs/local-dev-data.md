@@ -32,6 +32,27 @@ destroys the wrong database:
 Downloads are cached per version+size under `~/.cache/ndg-data/`; note the `L` datasets
 are ~290 MB uncompressed.
 
+### Without cloning this repo
+
+The script is self-contained — it needs nothing else from the repo:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DistantVoyager/nautobot-jobs/main/scripts/load-ndg-dataset.sh -o load-ndg-dataset.sh
+```
+
+```bash
+bash load-ndg-dataset.sh
+```
+
+Downloading first is the recommended form: you get to read it before it drops a schema,
+and the confirmation prompt works normally. Piping straight to `bash` also works — the
+prompt reads from `/dev/tty` rather than stdin — but if no terminal is available it
+refuses rather than proceeding unconfirmed, so add `--yes` for non-interactive use:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DistantVoyager/nautobot-jobs/main/scripts/load-ndg-dataset.sh | bash -s -- --yes
+```
+
 Result on a Nautobot 3.2.0 dev stack (PostgreSQL 17 restoring a PG 15 dump):
 
 | | |

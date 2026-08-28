@@ -18,6 +18,7 @@ TAGS=(
     "branch_main-persona_gizmo_nautobot3"
 )
 VALID_SIZES="S L"
+RAW_URL="https://raw.githubusercontent.com/DistantVoyager/nautobot-jobs/main/scripts/load-ndg-dataset.sh"
 
 usage() {
     cat <<EOF
@@ -42,6 +43,10 @@ Examples:
   $(basename "$0")                                  # autodetect containers, 3.1.4 small
   $(basename "$0") -v 3.0.6 -s L                    # larger 80-branch dataset
   $(basename "$0") -n my-nautobot-1 -d my-db-1 -y   # explicit containers, no prompt
+
+Without cloning the repo:
+  curl -fsSL $RAW_URL -o load-ndg-dataset.sh
+  bash load-ndg-dataset.sh
 EOF
 }
 
@@ -149,7 +154,15 @@ du -h nautobot.sql
 if [[ "$ASSUME_YES" -ne 1 ]]; then
     echo
     echo "!!! This DESTROYS all data in $DB_CONTAINER database '$DB_NAME'."
-    read -r -p "!!! Continue? [y/N] " reply
+    # Read from the terminal, not stdin: when the script is piped (curl ... | bash),
+    # stdin is the script itself and a plain `read` would consume it and see EOF.
+    if [[ -r /dev/tty ]]; then
+        read -r -p "!!! Continue? [y/N] " reply < /dev/tty
+    else
+        echo "error: no terminal available to confirm." >&2
+        echo "       Re-run with --yes, or download the script and run it directly." >&2
+        exit 1
+    fi
     [[ "$reply" == "y" || "$reply" == "Y" ]] || { echo "aborted"; exit 1; }
 fi
 
